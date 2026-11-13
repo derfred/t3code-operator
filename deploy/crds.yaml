@@ -1,0 +1,245 @@
+# The operator's CustomResourceDefinitions. Cluster-scoped: apply once per cluster.
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: t3environmentsets.t3code.derfred.com
+spec:
+  group: t3code.derfred.com
+  names:
+    kind: T3EnvironmentSet
+    listKind: T3EnvironmentSetList
+    plural: t3environmentsets
+    singular: t3environmentset
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: ".spec.statefulSet"
+      name: StatefulSet
+      type: string
+    - jsonPath: ".status.phase"
+      name: Phase
+      type: string
+    - jsonPath: ".metadata.creationTimestamp"
+      name: Age
+      type: date
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        properties:
+          spec:
+            properties:
+              statefulSet:
+                description: The StatefulSet whose pods are this set’s environments.
+                type: string
+            required:
+            - statefulSet
+            type: object
+          status:
+            type: object
+            x-kubernetes-preserve-unknown-fields: true
+        required:
+        - spec
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: t3projects.t3code.derfred.com
+spec:
+  group: t3code.derfred.com
+  names:
+    kind: T3Project
+    listKind: T3ProjectList
+    plural: t3projects
+    singular: t3project
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: ".spec.repository"
+      name: Repository
+      type: string
+    - jsonPath: ".status.phase"
+      name: Phase
+      type: string
+    - jsonPath: ".metadata.creationTimestamp"
+      name: Age
+      type: date
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        properties:
+          spec:
+            properties:
+              deletionPolicy:
+                default: Archive
+                description: 'When the project is deleted, or leaves an environment:
+                  Archive keeps threads and files; Delete removes the project and
+                  all its threads; Retain leaves it as it is. Its tasks are removed
+                  in every case, and the checkout stays on disk.'
+                enum:
+                - Archive
+                - Delete
+                - Retain
+                type: string
+              environmentSetSelector:
+                default: {}
+                description: 'T3EnvironmentSets to place the project on, on every
+                  one of their environments. Default {}: all of them.'
+                properties:
+                  matchExpressions:
+                    items:
+                      properties:
+                        key:
+                          type: string
+                        operator:
+                          enum:
+                          - In
+                          - NotIn
+                          - Exists
+                          - DoesNotExist
+                          type: string
+                        values:
+                          items:
+                            type: string
+                          type: array
+                      required:
+                      - key
+                      - operator
+                      type: object
+                    type: array
+                  matchLabels:
+                    additionalProperties:
+                      type: string
+                    type: object
+                type: object
+              path:
+                description: Checkout path in the pod. Default /workspace/<name>.
+                pattern: "^/"
+                type: string
+              project:
+                description: 'Fields of t3 project.update: defaultModelSelection,
+                  defaultThreadEnvMode, autoPull, scripts, projectIcon, pinned, archived.'
+                type: object
+                x-kubernetes-preserve-unknown-fields: true
+              repository:
+                description: Clone URL.
+                type: string
+              settings:
+                description: 'The project''s whole set of t3 setting overrides (projectSettingsOverrides).
+                  Absent: left alone, or cleared if the operator set it before.'
+                type: object
+                x-kubernetes-preserve-unknown-fields: true
+              tasks:
+                additionalProperties:
+                  properties:
+                    enabled:
+                      default: true
+                      type: boolean
+                    environmentSetSelector:
+                      description: 'Narrows the project''s environmentSetSelector.
+                        Default {}: no narrowing.'
+                      properties:
+                        matchExpressions:
+                          items:
+                            properties:
+                              key:
+                                type: string
+                              operator:
+                                enum:
+                                - In
+                                - NotIn
+                                - Exists
+                                - DoesNotExist
+                                type: string
+                              values:
+                                items:
+                                  type: string
+                                type: array
+                            required:
+                            - key
+                            - operator
+                            type: object
+                          type: array
+                        matchLabels:
+                          additionalProperties:
+                            type: string
+                          type: object
+                      type: object
+                    interactionMode:
+                      default: default
+                      enum:
+                      - default
+                      - plan
+                      type: string
+                    modelSelection:
+                      description: "{instanceId, model, options?}, e.g. {instanceId:
+                        claude, model: claude-haiku-5-5}."
+                      type: object
+                      x-kubernetes-preserve-unknown-fields: true
+                    placement:
+                      default: One
+                      description: 'One: a single environment holds the task, and
+                        keeps it across pod restarts. EachEnvironment: every one does,
+                        so it runs once per environment.'
+                      enum:
+                      - One
+                      - EachEnvironment
+                      type: string
+                    prompt:
+                      type: string
+                    runtimeMode:
+                      enum:
+                      - approval-required
+                      - auto-accept-edits
+                      - auto
+                      - full-access
+                      type: string
+                    schedule:
+                      description: 't3''s schedule: {type: interval, everyMs} | {type:
+                        fixed_time, timeOfDay, weekdays?} | {type: once, runAt} |
+                        {type: webhook, ...}.'
+                      type: object
+                      x-kubernetes-preserve-unknown-fields: true
+                    threadMode:
+                      enum:
+                      - new_thread
+                      - continue
+                      - fresh_session
+                      type: string
+                    title:
+                      description: 'Default "<project>: <task>".'
+                      type: string
+                    workspaceStrategy:
+                      description: 'Default {type: root}. Or {type: worktree, baseRef,
+                        branch?, startFromOrigin?}.'
+                      type: object
+                      x-kubernetes-preserve-unknown-fields: true
+                  required:
+                  - prompt
+                  - schedule
+                  - modelSelection
+                  - runtimeMode
+                  type: object
+                description: t3 scheduled tasks of this project, by name. t3 runs
+                  them; the operator only places their definitions.
+                type: object
+              title:
+                description: Project title in t3. Default <name>.
+                type: string
+            required:
+            - repository
+            type: object
+          status:
+            type: object
+            x-kubernetes-preserve-unknown-fields: true
+        required:
+        - spec
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}
