@@ -112,10 +112,31 @@ stands; each resource's status lists every environment with its phase
 
 ## Install
 
+With kubectl, from the rendered manifests:
+
 ```sh
 kubectl apply -f deploy/crds.yaml
-kubectl apply -f deploy/operator.yaml   # edit its namespace first; see the file
+kubectl apply -f deploy/operator.yaml   # edit its namespace and tokens first; see the file
 ```
+
+With jsonnet (Tanka, for one), from the library they are rendered from,
+`deploy/jsonnet`. Vendor it at a release tag with jsonnet-bundler (`jb install
+<repo>/deploy/jsonnet@vX.Y.Z`), then:
+
+```jsonnet
+local operator = import 't3code-operator/main.libsonnet';
+local cfg = operator.config {
+  namespace: 't3code',
+  // One per StatefulSet of t3 pods: the Secret with a token they accept.
+  tokens: [{ statefulSet: 't3code-bugzoo', secret: 't3code-api-token-bugzoo' }],
+};
+operator.crds + operator.objects(cfg)
+```
+
+`crds` are cluster-scoped and must exist before anything using their kinds is
+applied. `objects(cfg)` is the ServiceAccount, Role, RoleBinding and
+Deployment in `cfg.namespace`; `rules` is the Role's rules on their own.
+`config` documents every field; the default image is the release's own.
 
 Configuration is by environment variable: `NAMESPACE` (required; the
 Deployment sets it), `T3CODE_API_TOKEN_DIR` (required; one token
@@ -129,7 +150,14 @@ No dependencies: Node 24 runs the TypeScript in `src/` directly.
 ```sh
 npm test       # unit tests
 npm run e2e    # end-to-end; needs Docker and openssl
+npm run render # deploy/*.yaml from deploy/jsonnet; needs jsonnet (or $JSONNET)
 ```
+
+`deploy/crds.yaml` and `deploy/operator.yaml` are generated: change
+`deploy/jsonnet` (the CRDs' schemas in `crds.libsonnet` follow what
+`src/reconcile.ts` reads), then `npm run render`. `npm run render -- --check`
+fails on a stale render, and on `deploy/jsonnet/version.json` disagreeing with
+`package.json`.
 
 The end-to-end test (`e2e/run.ts`) runs the **production image**, built from
 the checkout, against a fake Kubernetes API server (`e2e/fake-apiserver.ts`:
@@ -158,12 +186,13 @@ that mode needs one there, as inside a pod.
 Moving the operator to a repository of its own:
 
 1. Move this directory's contents to the new repository's root.
-2. CI: `npm test` and `npm run e2e` on every push (in bugzoo-infrastructure,
-   the `operator` job of `test.yaml` and `t3code-operator-e2e.yaml`).
+2. CI: `npm test`, `npm run render -- --check` and `npm run e2e` on every
+   push (in bugzoo-infrastructure, the `operator` job of `test.yaml` and
+   `t3code-operator-e2e.yaml`).
 3. Release: on a `vX.Y.Z` tag matching `package.json`'s version, build the
    image, run `npm run e2e -- --operator-image <it>`, and push it, for example
-   to `ghcr.io/<owner>/t3code-operator:X.Y.Z`. `deploy/operator.yaml` names
-   that image.
-4. In bugzoo-infrastructure: run the released image instead of the source in
-   a ConfigMap, and take `deploy/crds.yaml` and the Role from the release
-   (vendored, like the other libraries there) instead of from this directory.
+   to `ghcr.io/<owner>/t3code-operator:X.Y.Z`. The library at that tag
+   defaults to that image.
+4. In bugzoo-infrastructure: vendor `deploy/jsonnet` from the new repository
+   at the release tag (a git source in `jsonnetfile.json` instead of the local
+   one), and run the released image instead of the source in a ConfigMap.
