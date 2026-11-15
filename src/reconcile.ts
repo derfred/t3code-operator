@@ -210,15 +210,26 @@ async function startClone(t3: T3, cr: ProjectResource, projectId: string, now: D
   return started?.projectId ?? projectId;
 }
 
-// t3 never takes a deleted project's id again. A project deleted before
+// t3 never takes a deleted project's id again, and doesn't always say so: a
+// clone started under one registers no project (t3 takes its create command,
+// whose id derives from the project's, as done already), clones anyway, and
+// leaves the checkout without a project. So a project deleted before
 // (deletionPolicy Delete, or a failed clone started over) comes back under a
-// fresh one; the status records it, and a lost status finds it by path.
-async function withFreshId<T>(name: string, attempt: (projectId: string) => Promise<T>): Promise<T> {
+// fresh id, chosen before asking t3: whenever t3 lists the plain id, deleted
+// or not. The status records it, and a lost status finds it by path. A t3
+// that refuses the id outright gets a fresh one too.
+const freshId = (name: string) => `${projectIdFor(name)}-${randomUUID().slice(0, 8)}`;
+async function withFreshId<T>(
+  name: string,
+  known: ReadonlyArray<Pick<T3Project, 'id'>>,
+  attempt: (projectId: string) => Promise<T>,
+): Promise<T> {
+  if (known.some((p) => p.id === projectIdFor(name))) return attempt(freshId(name));
   try {
     return await attempt(projectIdFor(name));
   } catch (error) {
     if (!/cannot be created twice/i.test(errorMessage(error))) throw error;
-    return attempt(`${projectIdFor(name)}-${randomUUID().slice(0, 8)}`);
+    return attempt(freshId(name));
   }
 }
 
@@ -267,7 +278,9 @@ async function syncProject(
       message: `cloning ${repository} into ${root}`,
     });
 
-  const live = (await t3.listProjects()).filter((p) => p.deletedAt === null);
+  // Deleted projects included: their ids are taken (withFreshId).
+  const known = await t3.listProjects();
+  const live = known.filter((p) => p.deletedAt === null);
   // Prefer the id this environment already uses; else adopt a project
   // registered at the same path by hand, so it keeps its threads.
   let project: Pick<T3Project, 'id'> | undefined =
@@ -275,12 +288,12 @@ async function syncProject(
 
   if (!project) {
     try {
-      const started = await withFreshId(name, (id) => startClone(t3, cr, id, now));
+      const started = await withFreshId(name, known, (id) => startClone(t3, cr, id, now));
       return cloning(started, cr.spec.repository);
     } catch (error) {
       // A checkout already on disk is registered as it is, not re-cloned.
       if (!/not empty/i.test(errorMessage(error))) throw error;
-      const id = await withFreshId(name, async (id) => {
+      const id = await withFreshId(name, known, async (id) => {
         await t3.mutateProject({ type: 'project.create', commandId: randomUUID(), projectId: id, title, workspaceRoot: root });
         return id;
       });
@@ -365,7 +378,9 @@ async function failedClone(
   const from = previous?.repository ?? clone.remoteUrl;
   if (from !== cr.spec.repository) {
     await t3.mutateProject({ type: 'project.delete', commandId: randomUUID(), projectId: clone.projectId, force: true });
-    const started = await withFreshId(cr.metadata.name, (id) => startClone(t3, cr, id, now));
+    // The id just deleted is taken now, listed or not.
+    const known = [...(await t3.listProjects()), { id: clone.projectId }];
+    const started = await withFreshId(cr.metadata.name, known, (id) => startClone(t3, cr, id, now));
     return cloning(started, cr.spec.repository, now.toISOString());
   }
   const failedAt = clone.endedAt === null ? 0 : Date.parse(clone.endedAt);

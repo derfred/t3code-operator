@@ -30,7 +30,8 @@ class FakeT3 implements T3 {
   gitWritten = new Set<string>();
   existingCheckouts = new Set<string>();
   // t3's clone records, by project id (subscribeProjectClones), and the ids
-  // of deleted projects, which t3 never takes again.
+  // of deleted projects, which t3 never takes again. Deleted projects stay
+  // listed, with deletedAt set, as in t3's snapshot.
   clones = new Map<string, CloneSnapshot>();
   deletedIds = new Set<string>();
   overrides: Record<string, unknown> = {};
@@ -46,12 +47,12 @@ class FakeT3 implements T3 {
       this.takeId(m.projectId);
       this.projects.push({ id: m.projectId, title: m.title, workspaceRoot: m.workspaceRoot, deletedAt: null });
     } else if (m.type === 'project.update') {
-      const project = this.projects.find((p) => p.id === m.projectId);
+      const project = this.live().find((p) => p.id === m.projectId);
       if (!project) throw new T3Error('Project not found');
       Object.assign(project, { title: m.title ?? project.title, archived: m.archived, pinned: m.pinned });
     } else if (m.type === 'project.delete') {
-      const project = this.projects.find((p) => p.id === m.projectId);
-      this.projects = this.projects.filter((p) => p.id !== m.projectId);
+      const project = this.live().find((p) => p.id === m.projectId);
+      if (project) project.deletedAt = '2026-11-13T00:00:00Z';
       this.deletedIds.add(m.projectId);
       // t3 discards the project's clone with it, and its partial folder.
       this.clones.delete(m.projectId);
@@ -73,7 +74,9 @@ class FakeT3 implements T3 {
         if (this.cloning.has(payload.destinationPath) || claimed) {
           throw new T3Error('A clone into this destination is already in progress.');
         }
-        if (!this.projects.some((p) => p.workspaceRoot === payload.destinationPath)) {
+        // A deleted id registers nothing: t3 takes the create command, whose
+        // id derives from the project's, as done already. The clone runs.
+        if (!this.live().some((p) => p.workspaceRoot === payload.destinationPath) && !this.deletedIds.has(payload.projectId)) {
           this.takeId(payload.projectId);
           this.projects.push({ id: payload.projectId, title: payload.title, workspaceRoot: payload.destinationPath, deletedAt: null });
         }
@@ -113,6 +116,9 @@ class FakeT3 implements T3 {
     throw new Error(`unexpected stream ${method}`);
   }
   close() {}
+  live() {
+    return this.projects.filter((p) => p.deletedAt === null);
+  }
   takeId(id: string) {
     if (this.deletedIds.has(id) || this.projects.some((p) => p.id === id)) {
       throw new T3Error(`Project '${id}' already exists and cannot be created twice.`);
@@ -362,10 +368,33 @@ describe('reconcileProject on an environment', () => {
     assert.equal(envStatus(kube, 'bugzoo-0').message, null, 'its own project, not an adopted one');
   });
 
+  it('starts over again under another fresh id, never the plain one t3 took', async () => {
+    const { deps, kube, world, server } = setup(one());
+    const t3 = server('bugzoo-0');
+    let cr = project({ repository: 'git@github.com:derfred/typo.git' });
+    for (const repository of ['git@github.com:derfred/typo2.git', 'git@github.com:derfred/infra.git']) {
+      await reconcileProject(deps, (cr = observed(cr, kube)), world());
+      t3.failClone(envStatus(kube, 'bugzoo-0').projectId!, 'ERROR: Repository not found.', deps.now().toISOString());
+      await reconcileProject(deps, (cr = observed(cr, kube)), world());
+      assert.equal(envStatus(kube, 'bugzoo-0').phase, 'Error');
+      cr = observed({ ...cr, spec: { ...cr.spec, repository } }, kube);
+    }
+    await reconcileProject(deps, cr, world());
+    const status = envStatus(kube, 'bugzoo-0');
+    assert.equal(status.phase, 'Cloning');
+    assert.match(status.projectId!, /^k8s-infra-[0-9a-f]{8}$/);
+    assert.deepEqual(
+      t3.live().map((p) => p.id),
+      [status.projectId],
+      'the clone registered its project: its id was never used before',
+    );
+  });
+
   it('clones a project recreated after a Delete under a fresh id', async () => {
     const { deps, kube, world, server } = setup(one());
     const t3 = server('bugzoo-0');
-    t3.deletedIds.add('k8s-infra');
+    t3.seed();
+    await t3.mutateProject({ type: 'project.delete', projectId: 'k8s-infra' });
     await reconcileProject(deps, project(), world());
     assert.match(envStatus(kube, 'bugzoo-0').projectId!, /^k8s-infra-[0-9a-f]{8}$/);
     assert.equal(envStatus(kube, 'bugzoo-0').phase, 'Cloning');
@@ -491,7 +520,7 @@ describe('reconcileProject on deletion', () => {
     const t3 = server('bugzoo-0').seed();
     await reconcileProject(deps, deleting('Delete'), world());
     assert.equal(t3.calls.at(-1)?.payload.force, true);
-    assert.equal(t3.projects.length, 0);
+    assert.equal(t3.live().length, 0);
   });
 
   it('keeps the project under Retain, but still removes its tasks', async () => {
