@@ -1,12 +1,9 @@
 // The t3code operator's install manifests, as a jsonnet library: the source
-// of deploy/crds.yaml and deploy/operator.yaml (`npm run render`), and what
-// a Tanka setup vendors at a release tag (jsonnet-bundler, this directory).
+// of deploy/install.yaml (`npm run render`), and what a Tanka setup vendors
+// at a release tag (jsonnet-bundler, this directory).
 //
 //   local operator = import 't3code-operator/main.libsonnet';
-//   local cfg = operator.config {
-//     namespace: 't3code',
-//     tokens: [{ statefulSet: 't3code-bugzoo', secret: 't3code-api-token-bugzoo' }],
-//   };
+//   local cfg = operator.config { namespace: 't3code' };
 //   operator.crds + operator.objects(cfg)
 //
 // `crds` are cluster-scoped: apply them before anything that uses their
@@ -27,10 +24,18 @@ local version = (import 'version.json').version;
     image: 'ghcr.io/derfred/t3code-operator:' + version,
     imagePullPolicy: 'IfNotPresent',
 
-    // One per StatefulSet of t3 pods: the Secret (in `namespace`) holding a
-    // token those pods accept, under `key`. Mounted as
-    // <tokenDir>/<statefulSet>, where the operator looks for it.
-    //   [{ statefulSet: 't3code-bugzoo', secret: 't3code-api-token-bugzoo' }]
+    // The API tokens, one per StatefulSet of t3 pods, each a token those
+    // pods accept, mounted as <tokenDir>/<statefulSet>, where the operator
+    // looks for it. By default all of them are keys of one Secret, named
+    // after the StatefulSets:
+    //   kubectl create secret generic t3code-operator-tokens --from-file=<statefulSet>=<file>
+    // It is optional: the operator starts without it, and reports a set
+    // whose token is missing.
+    tokenSecret: $.config.name + '-tokens',
+    // Or, instead, one Secret per StatefulSet, each holding its token under
+    // tokenKey (a Secret per set can come from its own source, such as one
+    // generated next to the set):
+    //   [{ statefulSet: 't3code-team', secret: 't3code-api-token-team' }]
     tokens: [],
     tokenKey: 'token',
     tokenDir: '/etc/t3code/api',
@@ -71,7 +76,6 @@ local version = (import 'version.json').version;
 
   objects(cfg):: (
     assert cfg.namespace != null : 't3code-operator: config.namespace is required';
-    assert std.length(cfg.tokens) > 0 : 't3code-operator: config.tokens needs one entry per StatefulSet of t3 pods';
     local metadata = { name: cfg.name, namespace: cfg.namespace, labels: cfg.labels };
     [
       {
@@ -135,14 +139,20 @@ local version = (import 'version.json').version;
                 name: 'api-token',
                 // One file per StatefulSet, named after it. Without subPath,
                 // so a rotated token reaches the operator without a restart.
-                projected: {
-                  defaultMode: 288,  // 0440, group = fsGroup
-                  sources: [
-                    { secret: { name: t.secret, items: [{ key: cfg.tokenKey, path: t.statefulSet }] } }
-                    for t in cfg.tokens
-                  ],
-                },
-              }],
+                // 0440, group = fsGroup.
+              } + (
+                if std.length(cfg.tokens) == 0 then {
+                  secret: { secretName: cfg.tokenSecret, optional: true, defaultMode: 288 },
+                } else {
+                  projected: {
+                    defaultMode: 288,
+                    sources: [
+                      { secret: { name: t.secret, items: [{ key: cfg.tokenKey, path: t.statefulSet }] } }
+                      for t in cfg.tokens
+                    ],
+                  },
+                }
+              )],
             },
           },
         },
