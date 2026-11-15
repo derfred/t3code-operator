@@ -13,12 +13,14 @@
 #   --no-forward            set up, print how to connect, and exit
 #   --delete                delete the cluster and exit
 #
-# What it applies, next to this script: t3.yaml (the t3 pod) and
-# project.yaml (what the operator puts on it), plus deploy/install.yaml.
+# What it applies, next to this script: tokens.yaml (the API token, from
+# External Secrets, rotated every 5 minutes), t3.yaml (the t3 pod) and
+# project.yaml (what the operator puts on it), plus deploy/install.yaml and
+# the External Secrets Operator's Helm chart.
 #
-# Needs docker (running), kind and kubectl. Re-running it is safe: it reuses
-# the cluster and the token, and rolls the pod onto a changed image. The
-# first build compiles t3 from source: a few minutes.
+# Needs docker (running), kind, kubectl and helm. Re-running it is safe: it
+# reuses the cluster, and rolls the pod onto a changed image. The first
+# build compiles t3 from source: a few minutes.
 set -eEuo pipefail
 
 cluster=${CLUSTER:-t3code-quickstart}
@@ -28,6 +30,7 @@ repository=https://github.com/derfred/t3code-operator.git
 from_source=false
 forward=true
 port=${PORT:-3773}
+eso_version=2.14.0   # the external-secrets Helm chart
 
 here=$(cd "$(dirname "$0")" && pwd)
 root=$(cd "$here/../.." && pwd)
@@ -51,10 +54,10 @@ hint() {
     docker) echo "  docker   https://docs.docker.com/get-docker/" ;;
     kind) echo "  kind     https://kind.sigs.k8s.io/docs/user/quick-start/#installation  (brew install kind)" ;;
     kubectl) echo "  kubectl  https://kubernetes.io/docs/tasks/tools/  (brew install kubectl)" ;;
-    openssl) echo "  openssl  your package manager's openssl" ;;
+    helm) echo "  helm     https://helm.sh/docs/intro/install/  (brew install helm)" ;;
   esac
 }
-for tool in docker kind kubectl openssl; do
+for tool in docker kind kubectl helm; do
   command -v "$tool" > /dev/null || missing+=("$tool")
 done
 if [ ${#missing[@]} -gt 0 ]; then
@@ -119,21 +122,18 @@ step "t3 image: examples/t3-image (t3 from the derfred/t3code fork, Claude Code,
 image=$(build quickstart/t3 "$root/examples/t3-image")
 echo "built $image"
 
-# ─── the token ───────────────────────────────────────────────────────────────
+# ─── the token, from External Secrets ───────────────────────────────────────
 # Before the operator, so it starts with its token rather than waiting for
-# the kubelet to fill in its optional Secret. Kept across re-runs.
-step "Token: one for the t3 pod and the operator"
+# the kubelet to fill in its optional Secret.
+step "External Secrets Operator: chart $eso_version"
+helm --kube-context "kind-$cluster" upgrade --install external-secrets external-secrets \
+  --repo https://charts.external-secrets.io --version "$eso_version" \
+  --namespace external-secrets --create-namespace --wait --timeout 5m
+
+step "Token (tokens.yaml): generated, and rotated every 5 minutes"
 k create namespace "$ns" --dry-run=client -o yaml | k apply -f -
-token_file=$(mktemp)
-trap 'rm -f "$token_file"' EXIT
-if ! k -n "$ns" get secret t3code-quickstart-api-token -o jsonpath='{.data.token}' 2>/dev/null |
-     base64 --decode > "$token_file" || [ ! -s "$token_file" ]; then
-  openssl rand -hex 32 > "$token_file"
-fi
-k -n "$ns" create secret generic t3code-quickstart-api-token --from-file=token="$token_file" \
-  --dry-run=client -o yaml | k apply -f -
-k -n "$ns" create secret generic t3code-operator-tokens --from-file=t3code-quickstart="$token_file" \
-  --dry-run=client -o yaml | k apply -f -
+k apply -f "$here/tokens.yaml"
+k -n "$ns" wait --for=condition=Ready externalsecret/t3code-operator-tokens --timeout=120s
 
 # ─── the operator ────────────────────────────────────────────────────────────
 step "Operator: deploy/install.yaml"
@@ -172,6 +172,7 @@ The project is on the pod, at /workspace/quickstart. Open t3 at
 threads. Then try:
   kubectl --context kind-$cluster -n $ns get t3projects -o yaml       # where it stands
   kubectl --context kind-$cluster -n $ns edit t3project quickstart    # change it; watch t3 follow
+  kubectl --context kind-$cluster -n $ns get externalsecret           # the token: rotated every 5 minutes
   examples/quickstart/quickstart.sh --delete                          # remove it all
 EOF
 

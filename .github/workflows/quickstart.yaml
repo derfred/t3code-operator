@@ -3,7 +3,8 @@ name: quickstart
 # Runs examples/quickstart/quickstart.sh as a user would, in kind: the
 # examples/t3-image, the operator built from this commit, and the project
 # cloned onto the pod. Then checks the project is Ready, the clone is on the
-# pod, and the image has what it promises (claude, uv).
+# pod, the image has what it promises (claude, uv), and a rotated API token
+# reaches both the pod and the operator.
 
 on:
   pull_request:
@@ -42,6 +43,33 @@ jobs:
           k exec t3code-quickstart-0 -c t3 -- git -C /workspace/quickstart log -1 --oneline
           k exec t3code-quickstart-0 -c t3 -- sh -c 'claude --version && uv --version'
 
+      # Rotates now rather than in 5 minutes (External Secrets' force-sync),
+      # then checks the new token reaches the pod's file, and that the
+      # operator still gets through to t3 with it: a spec change is applied.
+      - name: A rotated token reaches both sides
+        run: |
+          set -euo pipefail
+          k() { kubectl --context kind-t3code-quickstart -n t3code "$@"; }
+          until_() { # until_ SECONDS DESCRIPTION COMMAND...
+            local deadline=$((SECONDS + $1)) what=$2; shift 2
+            until "$@"; do
+              [ $SECONDS -lt $deadline ] || { echo "timed out waiting for $what" >&2; return 1; }
+              sleep 3
+            done
+            echo "$what"
+          }
+          secret() { k get secret t3code-operator-tokens -o jsonpath='{.data.t3code-quickstart}' | base64 --decode; }
+          old=$(secret)
+          k annotate externalsecret t3code-operator-tokens force-sync="$(date +%s)" --overwrite
+          until_ 60 "a new token in the Secret" sh -c "[ \"\$(kubectl --context kind-t3code-quickstart -n t3code get secret t3code-operator-tokens -o jsonpath='{.data.t3code-quickstart}' | base64 --decode)\" != '$old' ]"
+          new=$(secret)
+          until_ 150 "the new token in the pod's file" sh -c "[ \"\$(kubectl --context kind-t3code-quickstart -n t3code exec t3code-quickstart-0 -c t3 -- cat /etc/t3code/api/token)\" = '$new' ]"
+          hash() { k get t3project quickstart -o jsonpath='{.status.environments[0].appliedHash}'; }
+          before=$(hash)
+          k patch t3project quickstart --type=merge -p '{"spec":{"project":{"pinned":false}}}'
+          until_ 180 "the operator applied a change with the new token" sh -c "[ \"\$(kubectl --context kind-t3code-quickstart -n t3code get t3project quickstart -o jsonpath='{.status.environments[0].appliedHash}')\" != '$before' ]"
+          k get t3project quickstart -o jsonpath='{.status.environments[0].phase}{"\n"}'
+
       - name: Re-running is safe
         run: examples/quickstart/quickstart.sh --operator-from-source --no-forward
 
@@ -49,6 +77,7 @@ jobs:
         if: failure()
         run: |
           kubectl --context kind-t3code-quickstart -n t3code get all,t3projects,t3environmentsets -o wide || true
+          kubectl --context kind-t3code-quickstart -n t3code describe externalsecret t3code-operator-tokens || true
           kubectl --context kind-t3code-quickstart -n t3code describe pod t3code-quickstart-0 || true
           kubectl --context kind-t3code-quickstart -n t3code logs deploy/t3code-operator --tail 100 || true
           kubectl --context kind-t3code-quickstart -n t3code logs t3code-quickstart-0 -c t3 --tail 100 || true

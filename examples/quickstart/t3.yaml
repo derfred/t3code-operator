@@ -43,8 +43,10 @@ spec:
             - { name: home, mountPath: /home/node }       # t3's data, the Claude login, uv's Pythons
             - { name: workspace, mountPath: /workspace }  # the checkouts
       volumes:
-        - name: api-token
-          secret: { secretName: t3code-quickstart-api-token }
+        - name: api-token           # this StatefulSet's key of the operator's token Secret (tokens.yaml)
+          secret:
+            secretName: t3code-operator-tokens
+            items: [{ key: t3code-quickstart, path: token }]
   volumeClaimTemplates:
     - metadata: { name: home }
       spec: { accessModes: [ReadWriteOnce], resources: { requests: { storage: 1Gi } } }

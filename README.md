@@ -11,7 +11,7 @@ The pods are managed by a StatefulSet, not the operator. Design and trade-offs: 
 
 ## Try it locally
 
-With Docker, [kind](https://kind.sigs.k8s.io) and kubectl:
+With Docker, [kind](https://kind.sigs.k8s.io), kubectl and helm:
 
 ```sh
 examples/quickstart/quickstart.sh
@@ -20,7 +20,9 @@ examples/quickstart/quickstart.sh
 One command: a kind cluster, the t3 image built from source
 ([`examples/t3-image`](examples/t3-image/Dockerfile): t3 from the fork, Claude Code, uv), the
 operator, one t3 pod ([`t3.yaml`](examples/quickstart/t3.yaml)), and a project
-it clones there ([`project.yaml`](examples/quickstart/project.yaml)). It ends
+it clones there ([`project.yaml`](examples/quickstart/project.yaml)). The API
+token comes from the [External Secrets Operator](https://external-secrets.io),
+which rotates it every 5 minutes ([`tokens.yaml`](examples/quickstart/tokens.yaml)). It ends
 with a link to open t3 on localhost; `--delete` removes it all. `examples/t3-image/Dockerfile` is also the place to start your own image.
 
 ## Install
@@ -175,6 +177,16 @@ Every pod of the set accepts the same token, so any number of replicas works,
 and rotating is replacing both Secrets: neither t3 nor the operator needs a
 restart. A Secret per set keeps a pod that reads its own token from reaching
 any other set.
+
+To have tokens generated and rotated for you, use the
+[External Secrets Operator](https://external-secrets.io): a `Password`
+generator and an `ExternalSecret` with a `refreshInterval` write a fresh token
+into `t3code-operator-tokens`, and the pods mount their key of that same
+Secret, so both sides always read the same token.
+[`examples/quickstart/tokens.yaml`](examples/quickstart/tokens.yaml) rotates
+every 5 minutes; while the kubelet updates the mounted files (about a minute),
+the operator's calls may be refused, and it simply tries again on its next
+pass.
 
 **2. A session token from upstream t3.** Any T3 Code (for example `t3` from
 npm, as in [`e2e/t3.Dockerfile`](e2e/t3.Dockerfile)) issues bearer tokens
