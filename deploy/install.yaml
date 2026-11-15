@@ -353,7 +353,7 @@ spec:
           value: "300"
         - name: "CLONING_POLL_SECONDS"
           value: "5"
-        image: "ghcr.io/derfred/t3code-operator:0.1.0"
+        image: "ghcr.io/derfred/t3code-operator:0.1.1"
         imagePullPolicy: "IfNotPresent"
         name: "operator"
         resources:
