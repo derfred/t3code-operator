@@ -213,11 +213,11 @@ async function startClone(t3: T3, cr: ProjectResource, projectId: string, now: D
 // t3 never takes a deleted project's id again, and doesn't always say so: a
 // clone started under one registers no project (t3 takes its create command,
 // whose id derives from the project's, as done already), clones anyway, and
-// leaves the checkout without a project. So a project deleted before
-// (deletionPolicy Delete, or a failed clone started over) comes back under a
-// fresh id, chosen before asking t3: whenever t3 lists the plain id, deleted
-// or not. The status records it, and a lost status finds it by path. A t3
-// that refuses the id outright gets a fresh one too.
+// leaves the checkout without a project. Nor does t3 list deleted projects.
+// So the operator picks a fresh id itself whenever it knows the plain one is
+// used: t3 lists it, or a failed clone is started over. The status records the id, and a lost status finds it by path. A
+// project.create under a used id is refused (invalid_command; "cannot be
+// created twice" in older t3), and gets a fresh id too.
 const freshId = (name: string) => `${projectIdFor(name)}-${randomUUID().slice(0, 8)}`;
 async function withFreshId<T>(
   name: string,
@@ -228,7 +228,7 @@ async function withFreshId<T>(
   try {
     return await attempt(projectIdFor(name));
   } catch (error) {
-    if (!/cannot be created twice/i.test(errorMessage(error))) throw error;
+    if (!/cannot be created twice|invalid_command/i.test(errorMessage(error))) throw error;
     return attempt(freshId(name));
   }
 }
@@ -306,7 +306,13 @@ async function syncProject(
   // project can still be an unfinished or failed clone. Check until it has
   // files once; after that it is Ready and the check is skipped.
   if (previous?.phase !== 'Ready' || previous.projectId !== projectId) {
-    const listing = (await t3.call('projects.listEntries', { cwd: root })) as { entries: ReadonlyArray<unknown> };
+    // directoryPath '' reads the folder as it is now. Without it t3 answers
+    // from its search index for the path, which, made while a failed clone
+    // left the folder empty, stays empty after t3 deletes the folder and the
+    // new clone fills it.
+    const listing = (await t3.call('projects.listEntries', { cwd: root, directoryPath: '' })) as {
+      entries: ReadonlyArray<unknown>;
+    };
     if (listing.entries.length === 0) {
       const clone = await cloneOf(t3, projectId);
       if (clone?.phase === 'failed' || clone?.phase === 'cancelled') {
@@ -378,9 +384,8 @@ async function failedClone(
   const from = previous?.repository ?? clone.remoteUrl;
   if (from !== cr.spec.repository) {
     await t3.mutateProject({ type: 'project.delete', commandId: randomUUID(), projectId: clone.projectId, force: true });
-    // The id just deleted is taken now, listed or not.
-    const known = [...(await t3.listProjects()), { id: clone.projectId }];
-    const started = await withFreshId(cr.metadata.name, known, (id) => startClone(t3, cr, id, now));
+    // The plain id is used by now: it was this clone's, or one before it.
+    const started = await startClone(t3, cr, freshId(cr.metadata.name), now);
     return cloning(started, cr.spec.repository, now.toISOString());
   }
   const failedAt = clone.endedAt === null ? 0 : Date.parse(clone.endedAt);
