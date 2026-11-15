@@ -1,6 +1,6 @@
 {
   "name": "t3code-operator",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "private": true,
   "description": "Kubernetes operator that keeps T3 Code environments' projects and scheduled tasks in line with T3Project resources",
   "type": "module",
