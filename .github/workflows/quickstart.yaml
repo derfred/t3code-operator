@@ -1,7 +1,7 @@
 name: quickstart
 
 # Runs examples/quickstart/quickstart.sh as a user would, in kind: the
-# images/t3 image, the operator built from this commit, and the project
+# examples/t3-image, the operator built from this commit, and the project
 # cloned onto the pod. Then checks the project is Ready, the clone is on the
 # pod, and the image has what it promises (claude, uv).
 
@@ -9,7 +9,6 @@ on:
   pull_request:
     paths:
       - "examples/**"
-      - "images/t3/**"
       - "deploy/**"
       - "src/**"
       - ".github/workflows/quickstart.yaml"

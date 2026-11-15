@@ -4,8 +4,8 @@
 # token you choose (README.md, Tokens, the first way), plus Claude Code, which
 # t3's Claude provider runs, and uv for Python.
 #
-#   docker build -t t3 images/t3
-#   docker build -t t3 --build-arg T3_REF=<commit> images/t3      # pin a commit
+#   docker build -t t3 examples/t3-image
+#   docker build -t t3 --build-arg T3_REF=<commit> examples/t3-image      # pin a commit
 #
 # Multi-stage: each tool is fetched or built in a stage of its own, and only
 # its result is copied into a Debian slim base. No Node: t3 and Claude Code

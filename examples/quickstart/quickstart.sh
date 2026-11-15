@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # The operator, end to end, on your machine, in one command: a kind cluster,
-# the t3 image built from images/t3, the operator, one t3 pod, and a project
+# the t3 image built from examples/t3-image, the operator, one t3 pod, and a project
 # the operator clones onto it. It ends with a link to t3 on localhost.
 #
 #   examples/quickstart/quickstart.sh
@@ -115,8 +115,8 @@ build() { # build NAME CONTEXT
 }
 
 # ─── the t3 image ────────────────────────────────────────────────────────────
-step "t3 image: images/t3 (t3 from the derfred/t3code fork, Claude Code, uv)"
-image=$(build quickstart/t3 "$root/images/t3")
+step "t3 image: examples/t3-image (t3 from the derfred/t3code fork, Claude Code, uv)"
+image=$(build quickstart/t3 "$root/examples/t3-image")
 echo "built $image"
 
 # ─── the token ───────────────────────────────────────────────────────────────
