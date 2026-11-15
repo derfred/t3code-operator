@@ -1,0 +1,59 @@
+name: test
+
+# On every push and pull request:
+#
+#   unit  `npm test`, and `npm run render -- --check`: deploy/*.yaml is
+#         exactly what deploy/jsonnet renders, and deploy/jsonnet/version.json
+#         agrees with package.json.
+#   e2e   `npm run e2e`: the operator's image, built from this commit, against
+#         a fake Kubernetes API server and a t3 server, both in Docker. The t3
+#         is T3 Code from npm (e2e/t3.Dockerfile) unless run by hand with
+#         another image.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      t3-image:
+        description: "t3 image for the end-to-end test (default: T3 Code from npm, e2e/t3.Dockerfile)"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+jobs:
+  unit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: Unit tests
+        run: npm test
+      # Go is on the runner; go-jsonnet renders deploy/*.yaml from deploy/jsonnet.
+      - name: Rendered manifests are up to date
+        run: |
+          go install github.com/google/go-jsonnet/cmd/jsonnet@v0.21.0
+          JSONNET="$(go env GOPATH)/bin/jsonnet" npm run render -- --check
+
+  e2e:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: End-to-end
+        env:
+          T3_IMAGE: ${{ inputs.t3-image }}
+        run: |
+          set -euo pipefail
+          if [ -n "${T3_IMAGE:-}" ]; then
+            npm run e2e -- --t3-image "$T3_IMAGE"
+          else
+            npm run e2e
+          fi

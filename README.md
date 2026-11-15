@@ -16,13 +16,6 @@ The operator never creates or changes the StatefulSets: they stay yours. It
 reads them, talks to t3 on each pod, and sets one pod condition. Design and
 trade-offs: [docs/design.md](docs/design.md).
 
-**Where it lives, for now.** This directory is self-contained: everything the
-operator needs (source, tests, end-to-end test, Dockerfile, CRDs, install
-manifests) is in it, and nothing in it refers outside it. It sits in
-bugzoo-infrastructure until it gets a repository of its own; see
-[Extracting](#extracting). Nothing in that repository deploys it yet: the
-cluster wiring comes separately.
-
 ## Example
 
 ```yaml
@@ -125,7 +118,7 @@ kubectl apply -f deploy/operator.yaml   # edit its namespace and tokens first; s
 
 With jsonnet (Tanka, for one), from the library they are rendered from,
 `deploy/jsonnet`. Vendor it at a release tag with jsonnet-bundler (`jb install
-<repo>/deploy/jsonnet@vX.Y.Z`), then:
+github.com/derfred/t3code-operator/deploy/jsonnet@vX.Y.Z`), then:
 
 ```jsonnet
 local operator = import 't3code-operator/main.libsonnet';
@@ -163,6 +156,9 @@ npm run render # deploy/*.yaml from deploy/jsonnet; needs jsonnet (or $JSONNET)
 fails on a stale render, and on `deploy/jsonnet/version.json` disagreeing with
 `package.json`.
 
+CI (`.github/workflows/test.yaml`) runs all three checks on every push and
+pull request.
+
 The end-to-end test (`e2e/run.ts`) runs the **production image**, built from
 the checkout, against a fake Kubernetes API server (`e2e/fake-apiserver.ts`:
 HTTPS, watches, merge and strategic-merge patches, the status subresource,
@@ -184,19 +180,3 @@ Without Docker, `--operator process --t3-url URL --t3-token TOKEN --remote
 REPO --workspace DIR` runs `src/main.ts` as a process against a t3 you already
 have. The operator reads its service-account token from the standard path, so
 that mode needs one there, as inside a pod.
-
-## Extracting
-
-Moving the operator to a repository of its own:
-
-1. Move this directory's contents to the new repository's root.
-2. CI: `npm test`, `npm run render -- --check` and `npm run e2e` on every
-   push (in bugzoo-infrastructure, the `operator` job of `test.yaml` and
-   `t3code-operator-e2e.yaml`).
-3. Release: on a `vX.Y.Z` tag matching `package.json`'s version, build the
-   image, run `npm run e2e -- --operator-image <it>`, and push it, for example
-   to `ghcr.io/<owner>/t3code-operator:X.Y.Z`. The library at that tag
-   defaults to that image.
-4. In bugzoo-infrastructure: vendor `deploy/jsonnet` from the new repository
-   at the release tag (a git source in `jsonnetfile.json` instead of the local
-   one), and run the released image instead of the source in a ConfigMap.
