@@ -1,20 +1,29 @@
 # t3code-operator
 
-A Kubernetes operator for [T3 Code](https://github.com/pingdotgg/t3code)
-environments. You declare projects (repositories, their t3 settings, their
-scheduled tasks); it puts them on the t3 servers you run as StatefulSet pods,
-keeps them in line with the declaration, and holds each pod's readiness until
-its projects are in place.
+A Kubernetes operator for [T3 Code](https://github.com/pingdotgg/t3code) environments:
 
-- **Environment**: one t3 server, as t3 uses the word. Here, one pod.
-- **Environment set** (`T3EnvironmentSet`): a StatefulSet and the
-  environments it makes.
-- **Project** (`T3Project`): a repository, its t3 settings, and its scheduled
-  tasks, placed on the sets a label selector matches.
+- **Projects**: it creates/updates the projects on every pod. You only connect to the pod once and the operator ensures it contains current clones. Using an `environmentSetSelector` you can control the placement.
+- **Readiness**: pods (optionally) declare the readiness gate `t3code.derfred.com/content-ready` and become Ready only once all projects placed on them are present.
+- **Tasks**: manage scheduled tasks via the kubernetes manifest.
+- **Failed clones**: broken git urls show up as `Error` in the environment's entry.
 
-The operator never creates or changes the StatefulSets: they stay yours. It
-reads them, talks to t3 on each pod, and sets one pod condition. Design and
-trade-offs: [docs/design.md](docs/design.md).
+The pods are managed by a StatefulSet, not the operator. Design and trade-offs: [docs/design.md](docs/design.md).
+
+## Try it locally
+
+With Docker, [kind](https://kind.sigs.k8s.io), kubectl and helm:
+
+```sh
+examples/quickstart/quickstart.sh
+```
+
+One command: a kind cluster, the t3 image built from source
+([`examples/t3-image`](examples/t3-image/Dockerfile): t3 from the fork, Claude Code, uv), the
+operator, one t3 pod ([`t3.yaml`](examples/quickstart/t3.yaml)), and a project
+it clones there ([`project.yaml`](examples/quickstart/project.yaml)). The API
+token comes from the [External Secrets Operator](https://external-secrets.io),
+which rotates it every 5 minutes ([`tokens.yaml`](examples/quickstart/tokens.yaml)). It ends
+with a link to open t3 on localhost; `--delete` removes it all. `examples/t3-image/Dockerfile` is also the place to start your own image.
 
 ## Install
 
@@ -22,16 +31,11 @@ trade-offs: [docs/design.md](docs/design.md).
 kubectl apply -f https://raw.githubusercontent.com/derfred/t3code-operator/v0.1.0/deploy/install.yaml
 ```
 
-That is [`deploy/install.yaml`](deploy/install.yaml) at a release: the
+The manifest [`deploy/install.yaml`](deploy/install.yaml) sets up the
 namespace `t3code`, the two CustomResourceDefinitions, and the operator
-(ServiceAccount, Role, RoleBinding, Deployment). It runs as is; the operator
-then needs a token for each StatefulSet of t3 pods it manages, in Secret
-`t3code-operator-tokens` (see [Tokens](#tokens)).
+(ServiceAccount, Role, RoleBinding, Deployment). The operator needs a token for each StatefulSet of t3 pods it manages, in Secret `t3code-operator-tokens` (see [Tokens](#tokens)).
 
-For another namespace, or one Secret per StatefulSet, use the jsonnet library
-it is rendered from, `deploy/jsonnet` (Tanka, for one). Vendor it at a release
-tag with jsonnet-bundler (`jb install
-github.com/derfred/t3code-operator/deploy/jsonnet@v0.1.0`), then:
+For more customizability use the jsonnet library.  Vendor it at a release tag with jsonnet-bundler (`jb install github.com/derfred/t3code-operator/deploy/jsonnet@v0.1.0`), then:
 
 ```jsonnet
 local operator = import 't3code-operator/main.libsonnet';
@@ -48,12 +52,46 @@ applied. `objects(cfg)` is the ServiceAccount, Role, RoleBinding and
 Deployment in `cfg.namespace`; `rules` is the Role's rules on their own.
 `config` documents every field; the default image is the release's own.
 
-## Example
+### Example
 
-The t3 servers: a StatefulSet of two pods, each with its own home and
-workspace volumes. The operator never creates these; they are yours to shape.
-This one runs an image whose t3 reads its API token from a file (the first
-way under [Tokens](#tokens)):
+An environment set with two pods with their own home & workspace volumes. Also a project at the specified repository is automatically created on the pods, even if they are scaled or recreated later.
+
+```yaml
+apiVersion: t3code.derfred.com/v1alpha1
+kind: T3EnvironmentSet
+metadata:
+  name: team
+  namespace: t3code
+  labels: { tier: team }
+spec:
+  statefulSet: t3code-team          # its pods are this set's environments, see below
+---
+apiVersion: t3code.derfred.com/v1alpha1
+kind: T3Project
+metadata:
+  name: my-app
+  namespace: t3code
+spec:
+  repository: https://github.com/example/my-app.git
+  environmentSetSelector:           # a LabelSelector; {} (the default) = every set
+    matchLabels: { tier: team }
+  # path: /workspace/my-app         # default /workspace/<name>
+  project:                          # t3 project.update fields
+    defaultThreadEnvMode: worktree
+    autoPull: true
+  settings:                         # the project's t3 setting overrides, as a whole
+    branchNamePrefix: agent/
+  # deletionPolicy: Archive         # Archive | Delete | Retain
+  tasks:
+    dependencies:                   # a t3 scheduled task; t3 runs it
+      prompt: Check for outdated dependencies and open a PR for any that are behind.
+      schedule: { type: fixed_time, timeOfDay: "03:00", weekdays: [1, 2, 3, 4, 5] }
+      modelSelection: { instanceId: claudeAgent, model: claude-haiku-5-5 }  # t3's instance id, not the driver's name
+      runtimeMode: full-access
+      # placement: One              # One | EachEnvironment
+```
+
+This requires a stateful set definition like this one:
 
 ```yaml
 apiVersion: v1
@@ -82,12 +120,12 @@ spec:
     metadata:
       labels: { app: t3code-team }
     spec:
-      readinessGates:               # Ready once the operator has put the projects in place
+      readinessGates:               # Optional: Ready once the operator has put the projects in place
         - conditionType: t3code.derfred.com/content-ready
       securityContext: { runAsUser: 1000, runAsGroup: 1000, fsGroup: 1000, runAsNonRoot: true }
       containers:
         - name: t3
-          image: ghcr.io/derfred/t3code:2026.11.13-2
+          image: ghcr.io/derfred/t3code:2026.11.13-2 # Use your own image here, see examples/t3-image/Dockerfile
           # On all addresses, so the operator reaches it on the pod's IP.
           command: [t3, serve, --host, 0.0.0.0, --port, "3773"]
           env:
@@ -109,93 +147,11 @@ spec:
       spec: { accessModes: [ReadWriteOnce], resources: { requests: { storage: 20Gi } } }
 ```
 
-What the operator puts on them:
-
-```yaml
-apiVersion: t3code.derfred.com/v1alpha1
-kind: T3EnvironmentSet
-metadata:
-  name: team
-  namespace: t3code
-  labels: { tier: team }
-spec:
-  statefulSet: t3code-team          # its pods are this set's environments
----
-apiVersion: t3code.derfred.com/v1alpha1
-kind: T3Project
-metadata:
-  name: my-app
-  namespace: t3code
-spec:
-  repository: https://github.com/example/my-app.git
-  environmentSetSelector:           # a LabelSelector; {} (the default) = every set
-    matchLabels: { tier: team }
-  # path: /workspace/my-app         # default /workspace/<name>
-  project:                          # t3 project.update fields
-    defaultThreadEnvMode: worktree
-    autoPull: true
-  settings:                         # the project's t3 setting overrides, as a whole
-    branchNamePrefix: agent/
-  # deletionPolicy: Archive         # Archive | Delete | Retain
-  tasks:
-    dependencies:                   # a t3 scheduled task; t3 runs it
-      prompt: Check for outdated dependencies and open a PR for any that are behind.
-      schedule: { type: fixed_time, timeOfDay: "03:00", weekdays: [1, 2, 3, 4, 5] }
-      modelSelection: { instanceId: claudeAgent, model: claude-haiku-5-5 }  # t3's instance id, not the driver's name
-      runtimeMode: full-access
-      # placement: One              # One | EachEnvironment
-```
-
 `kubectl -n t3code get t3projects,t3environmentsets` shows where everything
 stands; each resource's status lists every environment with its phase
 (`Waiting`, `Cloning`, `Ready`, `Error`) and message.
 
-## What it does
-
-- **Projects**: on every environment of every set the selector matches, it
-  clones the repository (or registers a checkout already there, or adopts a
-  project added by hand at the same path), then applies `project` and
-  `settings`. An environment the selector stops matching loses the project by
-  `deletionPolicy`; deleting the T3Project does the same everywhere (a
-  finalizer holds it until done). `Archive` keeps threads and files; `Delete`
-  removes the project and its threads; `Retain` leaves it. Checkouts are never
-  deleted from disk.
-- **Failed clones**: the environment's entry turns `Error` with git's message,
-  and is retried every 5 minutes. Fix `repository` and it starts over at
-  once: the failed project, which has no files, is deleted and the new
-  repository cloned.
-- **Tasks**: `placement: One` puts the task on a single environment, which
-  keeps it across pod restarts (its thread lives there); `EachEnvironment` on
-  all, so it runs once per environment. A task's own `environmentSetSelector`
-  narrows its project's.
-- **Readiness**: pods that declare the readiness gate
-  `t3code.derfred.com/content-ready` become Ready only once no project placed
-  on them is still on its way, so a StatefulSet rollout waits for each pod's
-  projects. An `Error` doesn't hold the gate, nor does a clone older than 15
-  minutes.
-- **When**: at once on a change (watches on its resources and the pods), every
-  5 seconds while a clone is under way, and every 5 minutes as a safety net.
-  Unchanged specs are re-applied hourly, which undoes edits made in t3's UI to
-  what the resource manages.
-
-## Requirements
-
-- **t3** on every pod, listening on `T3CODE_PORT` (3773) on all addresses
-  (`t3 serve --host 0.0.0.0`), reachable from the operator on the pod's IP.
-- **A token per StatefulSet that its t3 servers accept**: see
-  [Tokens](#tokens).
-- **The readiness gate** in the StatefulSet's pod template, if you want
-  rollouts to wait for projects:
-  ```yaml
-  readinessGates:
-    - conditionType: t3code.derfred.com/content-ready
-  ```
-  Pods only become Ready once the operator has marked them, so the operator
-  must be running. Services that should reach a pod before it's Ready (such as
-  the one you connect through) want `publishNotReadyAddresses: true`.
-- **Node 24** to run it from source; the image has it.
-
-### Tokens
+## Auth Tokens
 
 The operator calls t3's API with a bearer token, one per StatefulSet: a file
 named after the StatefulSet, which `install.yaml` mounts from the keys of
@@ -207,15 +163,8 @@ are two ways to get one that the pods accept.
 adds `t3 serve --auth-token-file FILE` (or `T3CODE_AUTH_TOKEN_FILE`): t3
 accepts the token in that file, any string of at least 32 characters, and
 re-reads it when it changes. The image `ghcr.io/derfred/t3code`, used in the
-[Example](#example), has it. Or build a minimal one, t3 from the fork and
-git, from [`images/t3`](images/t3/Dockerfile):
-
-```sh
-docker build -t my-registry/t3 images/t3                                # the fork's branch
-docker build -t my-registry/t3 --build-arg T3_REF=<commit> images/t3    # a pinned commit
-```
-
-Generate a token and give it to both sides, the pods and the operator:
+[Example](#example), has it. Generate a token and give it to both sides, the
+pods and the operator:
 
 ```sh
 openssl rand -hex 32 > token
@@ -228,6 +177,17 @@ Every pod of the set accepts the same token, so any number of replicas works,
 and rotating is replacing both Secrets: neither t3 nor the operator needs a
 restart. A Secret per set keeps a pod that reads its own token from reaching
 any other set.
+
+To have tokens generated and rotated for you, use the
+[External Secrets Operator](https://external-secrets.io): a `Password`
+generator and an `ExternalSecret` with a `refreshInterval` write a fresh token
+into `t3code-operator-tokens`, and the pods mount their key of that same
+Secret, so both sides always read the same token.
+[`examples/quickstart/tokens.yaml`](examples/quickstart/tokens.yaml) rotates
+every 5 minutes. The kubelet updates each pod's mounted copy on its own
+schedule, from seconds to a few minutes, so for a while after each rotation
+the operator's calls may be refused; it simply tries again on its next pass.
+Rotate less often where that matters.
 
 **2. A session token from upstream t3.** Any T3 Code (for example `t3` from
 npm, as in [`e2e/t3.Dockerfile`](e2e/t3.Dockerfile)) issues bearer tokens
@@ -279,14 +239,6 @@ fails on a stale render, and on `deploy/jsonnet/version.json` disagreeing with
 
 CI (`.github/workflows/test.yaml`) runs all three checks on every push and
 pull request.
-
-**Releasing** vX.Y.Z: set the version in `package.json` and
-`deploy/jsonnet/version.json`, merge, and push the tag (`git tag -a vX.Y.Z -m
-vX.Y.Z && git push origin vX.Y.Z`). `.github/workflows/release.yaml` then
-runs the checks, the end-to-end test against the image it built, pushes
-`ghcr.io/derfred/t3code-operator:X.Y.Z` (amd64 and arm64), and creates the
-GitHub release with `install.yaml` attached. The library at that tag defaults
-to that image.
 
 The end-to-end test (`e2e/run.ts`) runs the **production image**, built from
 the checkout, against a fake Kubernetes API server (`e2e/fake-apiserver.ts`:

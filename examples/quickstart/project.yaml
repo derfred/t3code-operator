@@ -1,0 +1,30 @@
+# What the operator puts on the t3 servers. quickstart.sh fills in
+# ${REPOSITORY} (--repository; default: this repository). Edit the T3Project
+# once it's running (kubectl -n t3code edit t3project quickstart) and watch
+# t3 follow.
+apiVersion: t3code.derfred.com/v1alpha1
+kind: T3EnvironmentSet
+metadata:
+  name: quickstart
+  namespace: t3code
+  labels: { tier: quickstart }
+spec:
+  statefulSet: t3code-quickstart    # its pods are this set's environments
+---
+apiVersion: t3code.derfred.com/v1alpha1
+kind: T3Project
+metadata:
+  name: quickstart
+  namespace: t3code
+spec:
+  repository: ${REPOSITORY}
+  environmentSetSelector:           # a LabelSelector over the sets' labels
+    matchLabels: { tier: quickstart }
+  project:                          # t3 project.update fields
+    pinned: true
+  # tasks:                          # a t3 scheduled task, once you've logged in to Claude in t3
+  #   hello:
+  #     prompt: Summarise what changed in this repository in the last day.
+  #     schedule: { type: fixed_time, timeOfDay: "09:00" }
+  #     modelSelection: { instanceId: claudeAgent, model: claude-haiku-5-5 }
+  #     runtimeMode: full-access

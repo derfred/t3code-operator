@@ -1,0 +1,42 @@
+# The API token, made and rotated by External Secrets: a Password generator,
+# and an ExternalSecret that writes a fresh one into Secret
+# t3code-operator-tokens every 5 minutes. Both sides read that one Secret: the
+# operator mounts it whole (one key per StatefulSet, named after it), the t3
+# pods mount their key as T3CODE_AUTH_TOKEN_FILE (t3.yaml). Neither needs a
+# restart: the kubelet updates the mounted files, t3 re-reads its own, and the
+# operator reads its own on every pass. Until both have the new one (the
+# kubelet takes seconds to a few minutes) the operator's calls may be
+# refused, and it tries again.
+apiVersion: generators.external-secrets.io/v1alpha1
+kind: Password
+metadata:
+  name: t3code-api-token
+  namespace: t3code
+spec:
+  length: 64
+  digits: 16
+  symbols: 0
+  noUpper: false
+  allowRepeat: true
+  secretKeys: [token]
+---
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: t3code-operator-tokens
+  namespace: t3code
+spec:
+  refreshPolicy: Periodic
+  refreshInterval: 5m               # a new token every 5 minutes
+  dataFrom:
+    - sourceRef:
+        generatorRef:
+          apiVersion: generators.external-secrets.io/v1alpha1
+          kind: Password
+          name: t3code-api-token
+  target:
+    name: t3code-operator-tokens    # the Secret deploy/install.yaml mounts
+    creationPolicy: Owner
+    template:
+      data:
+        t3code-quickstart: "{{ .token }}"   # the StatefulSet's name: its pods' token
