@@ -55,7 +55,7 @@ spec:
     charts:                         # a t3 scheduled task; t3 runs it
       prompt: Run the chart check and open a PR for anything behind.
       schedule: { type: fixed_time, timeOfDay: "03:00", weekdays: [1, 2, 3, 4, 5] }
-      modelSelection: { instanceId: claude, model: claude-haiku-5-5 }
+      modelSelection: { instanceId: claudeAgent, model: claude-haiku-5-5 }  # t3's instance id, not the driver's name
       runtimeMode: full-access
       # placement: One              # One | EachEnvironment
 ```

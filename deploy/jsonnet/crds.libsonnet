@@ -76,7 +76,7 @@ local task = {
     title: string('Default "<project>: <task>".'),
     enabled: { type: 'boolean', default: true },
     schedule: opaque("t3's schedule: {type: interval, everyMs} | {type: fixed_time, timeOfDay, weekdays?} | {type: once, runAt} | {type: webhook, ...}."),
-    modelSelection: opaque('{instanceId, model, options?}, e.g. {instanceId: claude, model: claude-haiku-5-5}.'),
+    modelSelection: opaque('{instanceId, model, options?}, e.g. {instanceId: claudeAgent, model: claude-haiku-5-5}: the instance as t3 names it (its built-in ones are claudeAgent and codex).'),
     runtimeMode: enum(['approval-required', 'auto-accept-edits', 'auto', 'full-access']),
     interactionMode: enum(['default', 'plan'], default='default'),
     threadMode: enum(['new_thread', 'continue', 'fresh_session']),

@@ -144,7 +144,7 @@ const project = (spec: Partial<ProjectResource['spec']> = {}, extra: Partial<Pro
 const task = (overrides: Partial<TaskSpec> = {}): TaskSpec => ({
   prompt: 'Check charts.',
   schedule: { type: 'fixed_time', timeOfDay: '03:00' },
-  modelSelection: { instanceId: 'claude', model: 'claude-haiku-5-5' },
+  modelSelection: { instanceId: 'claudeAgent', model: 'claude-haiku-5-5' },
   runtimeMode: 'full-access',
   ...overrides,
 });
@@ -411,7 +411,7 @@ describe('task placement', () => {
       schedule: { type: 'fixed_time', timeOfDay: '03:00' },
       projectId: 'k8s-infra',
       workspaceStrategy: { type: 'root' },
-      modelSelection: { instanceId: 'claude', model: 'claude-haiku-5-5' },
+      modelSelection: { instanceId: 'claudeAgent', model: 'claude-haiku-5-5' },
       runtimeMode: 'full-access',
       interactionMode: 'default',
     });

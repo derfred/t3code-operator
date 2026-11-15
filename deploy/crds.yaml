@@ -172,7 +172,7 @@ spec:
                       - "plan"
                       type: "string"
                     modelSelection:
-                      description: "{instanceId, model, options?}, e.g. {instanceId: claude, model: claude-haiku-5-5}."
+                      description: "{instanceId, model, options?}, e.g. {instanceId: claudeAgent, model: claude-haiku-5-5}: the instance as t3 names it (its built-in ones are claudeAgent and codex)."
                       type: "object"
                       x-kubernetes-preserve-unknown-fields: true
                     placement:
