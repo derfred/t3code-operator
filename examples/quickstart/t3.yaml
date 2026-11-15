@@ -1,0 +1,52 @@
+# The t3 servers: one pod, with its own home and workspace volumes. The
+# operator never creates these; they're yours to shape. quickstart.sh fills
+# in ${IMAGE}, the image it built and loaded into kind.
+apiVersion: v1
+kind: Service
+metadata:
+  name: t3code-quickstart
+  namespace: t3code
+spec:
+  clusterIP: None                   # the StatefulSet's headless Service
+  publishNotReadyAddresses: true    # reach the pod while the operator holds its readiness
+  selector: { app: t3code-quickstart }
+  ports: [{ name: http, port: 3773 }]
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: t3code-quickstart
+  namespace: t3code
+spec:
+  serviceName: t3code-quickstart
+  replicas: 1
+  selector:
+    matchLabels: { app: t3code-quickstart }
+  template:
+    metadata:
+      labels: { app: t3code-quickstart }
+    spec:
+      readinessGates:               # Ready once the operator has put the projects in place
+        - conditionType: t3code.derfred.com/content-ready
+      securityContext: { runAsUser: 1000, runAsGroup: 1000, fsGroup: 1000, runAsNonRoot: true }
+      containers:
+        - name: t3
+          image: ${IMAGE}
+          imagePullPolicy: Never    # loaded into kind, not pulled
+          env:
+            - name: T3CODE_AUTH_TOKEN_FILE   # the token the operator calls t3 with
+              value: /etc/t3code/api/token
+          ports: [{ name: http, containerPort: 3773 }]
+          readinessProbe: { tcpSocket: { port: 3773 } }   # / needs auth: probe the port
+          volumeMounts:
+            - { name: api-token, mountPath: /etc/t3code/api, readOnly: true }
+            - { name: home, mountPath: /home/node }       # t3's data, the Claude login, uv's Pythons
+            - { name: workspace, mountPath: /workspace }  # the checkouts
+      volumes:
+        - name: api-token
+          secret: { secretName: t3code-quickstart-api-token }
+  volumeClaimTemplates:
+    - metadata: { name: home }
+      spec: { accessModes: [ReadWriteOnce], resources: { requests: { storage: 1Gi } } }
+    - metadata: { name: workspace }
+      spec: { accessModes: [ReadWriteOnce], resources: { requests: { storage: 2Gi } } }

@@ -21,15 +21,15 @@ trade-offs: [docs/design.md](docs/design.md).
 With Docker, [kind](https://kind.sigs.k8s.io) and kubectl:
 
 ```sh
-examples/quickstart.sh --dockerfile examples/Dockerfile
+examples/quickstart/quickstart.sh
 ```
 
-One command: a kind cluster, a t3 image built from source (the minimal
-[`images/t3`](images/t3/Dockerfile), plus Node and Claude Code from
-[`examples/Dockerfile`](examples/Dockerfile)), the operator, one t3 pod, and
-a project it clones there. It ends with a link to open t3 on localhost.
-Leave out `--dockerfile` for the minimal image alone; `--delete` removes it
-all. `examples/Dockerfile` is also the place to start your own image.
+One command: a kind cluster, the t3 image built from source
+([`images/t3`](images/t3/Dockerfile): t3 from the fork, Claude Code, uv), the
+operator, one t3 pod ([`t3.yaml`](examples/quickstart/t3.yaml)), and a project
+it clones there ([`project.yaml`](examples/quickstart/project.yaml)). It ends
+with a link to open t3 on localhost; `--delete` removes it all.
+`images/t3/Dockerfile` is also the place to start your own image.
 
 ## Install
 
@@ -222,8 +222,8 @@ are two ways to get one that the pods accept.
 adds `t3 serve --auth-token-file FILE` (or `T3CODE_AUTH_TOKEN_FILE`): t3
 accepts the token in that file, any string of at least 32 characters, and
 re-reads it when it changes. The image `ghcr.io/derfred/t3code`, used in the
-[Example](#example), has it. Or build a minimal one, t3 from the fork and
-git, from [`images/t3`](images/t3/Dockerfile):
+[Example](#example), has it. Or build a small one from
+[`images/t3`](images/t3/Dockerfile): t3 from the fork, plus Claude Code and uv.
 
 ```sh
 docker build -t my-registry/t3 images/t3                                # the fork's branch

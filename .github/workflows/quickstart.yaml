@@ -1,9 +1,9 @@
 name: quickstart
 
-# Runs examples/quickstart.sh as a user would, in kind: images/t3 with
-# examples/Dockerfile on top, the operator built from this commit, and the
-# project cloned onto the pod. Then checks the project is Ready, the clone is
-# on the pod, and the example image has what it promises (claude, rbenv, uv).
+# Runs examples/quickstart/quickstart.sh as a user would, in kind: the
+# images/t3 image, the operator built from this commit, and the project
+# cloned onto the pod. Then checks the project is Ready, the clone is on the
+# pod, and the image has what it promises (claude, uv).
 
 on:
   pull_request:
@@ -30,8 +30,8 @@ jobs:
           sudo install kind /usr/local/bin/kind && rm kind
           kind version
 
-      - name: examples/quickstart.sh
-        run: examples/quickstart.sh --dockerfile examples/Dockerfile --operator-from-source --no-forward
+      - name: examples/quickstart/quickstart.sh
+        run: examples/quickstart/quickstart.sh --operator-from-source --no-forward
 
       - name: The project is Ready, and on the pod
         run: |
@@ -41,11 +41,10 @@ jobs:
           echo "T3Project quickstart: $phase"
           [ "$phase" = Ready ]
           k exec t3code-quickstart-0 -c t3 -- git -C /workspace/quickstart log -1 --oneline
-          k exec t3code-quickstart-0 -c t3 -- claude --version
-          k exec t3code-quickstart-0 -c t3 -- sh -c 'rbenv --version && ruby-build --version && uv --version'
+          k exec t3code-quickstart-0 -c t3 -- sh -c 'claude --version && uv --version'
 
       - name: Re-running is safe
-        run: examples/quickstart.sh --dockerfile examples/Dockerfile --operator-from-source --no-forward
+        run: examples/quickstart/quickstart.sh --operator-from-source --no-forward
 
       - name: Diagnostics
         if: failure()
