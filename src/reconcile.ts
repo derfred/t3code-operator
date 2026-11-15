@@ -252,10 +252,16 @@ async function syncProject(
   if (previous?.phase !== 'Ready' || previous.projectId !== projectId) {
     const listing = (await t3.call('projects.listEntries', { cwd: root })) as { entries: ReadonlyArray<unknown> };
     if (listing.entries.length === 0) {
+      // Empty to the listing, which skips .git, is also a clone under way:
+      // git has written .git but checked nothing out yet. t3 checks the
+      // destination before it looks for a running clone, so that start
+      // fails "not empty" rather than "in progress". Both mean: still
+      // cloning. So is a failed clone that left .git behind: like a clone
+      // that never finishes, it holds the gate CLONE_GATE_MS at most.
       try {
         await startClone(t3, cr, projectId, now);
       } catch (error) {
-        if (!/in progress/i.test(errorMessage(error))) throw error;
+        if (!/in progress|not empty/i.test(errorMessage(error))) throw error;
       }
       return environmentStatus({
         ...carried,

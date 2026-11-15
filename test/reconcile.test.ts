@@ -24,6 +24,8 @@ class FakeT3 implements T3 {
   projects: Array<T3Project & { archived?: boolean; pinned?: boolean }> = [];
   files = new Map<string, number>();
   cloning = new Set<string>();
+  // Clones that have written .git, which projects.listEntries doesn't list.
+  gitWritten = new Set<string>();
   existingCheckouts = new Set<string>();
   overrides: Record<string, unknown> = {};
   tasks = new Map<string, Record<string, unknown>>();
@@ -48,8 +50,11 @@ class FakeT3 implements T3 {
     this.calls.push({ method, payload });
     switch (method) {
       case 'projectClone.start': {
+        // As t3 does: the destination is checked before any running clone.
+        if (this.existingCheckouts.has(payload.destinationPath) || this.gitWritten.has(payload.destinationPath)) {
+          throw new T3Error('Destination path already exists and is not empty.');
+        }
         if (this.cloning.has(payload.destinationPath)) throw new T3Error('A clone into this destination is already in progress.');
-        if (this.existingCheckouts.has(payload.destinationPath)) throw new T3Error('Destination path already exists and is not empty.');
         if (!this.projects.some((p) => p.workspaceRoot === payload.destinationPath)) {
           this.projects.push({ id: payload.projectId, title: payload.title, workspaceRoot: payload.destinationPath, deletedAt: null });
         }
@@ -238,6 +243,11 @@ describe('reconcileProject on an environment', () => {
     await reconcileProject(deps, (cr = observed(cr, kube)), world());
     assert.equal(envStatus(kube, 'bugzoo-0').phase, 'Cloning', 'a second start reports "in progress"');
     assert.equal(envStatus(kube, 'bugzoo-0').cloningSince, startedAt, 'the clone keeps its start time');
+
+    t3.gitWritten.add('/workspace/infra');
+    await reconcileProject(deps, (cr = observed(cr, kube)), world());
+    assert.equal(envStatus(kube, 'bugzoo-0').phase, 'Cloning', 'only .git yet: t3 says "not empty", still cloning');
+    assert.equal(envStatus(kube, 'bugzoo-0').message, 'cloning git@github.com:derfred/infra.git into /workspace/infra');
 
     t3.cloning.clear();
     t3.files.set('/workspace/infra', 3);
