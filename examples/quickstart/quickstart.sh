@@ -158,6 +158,24 @@ k -n "$ns" rollout status statefulset/t3code-quickstart --timeout=600s
 k -n "$ns" wait --for=condition=Ready "pod/$pod" --timeout=600s
 k -n "$ns" get t3environmentsets,t3projects
 
+# ─── Claude ──────────────────────────────────────────────────────────────────
+# t3's Claude provider runs the claude CLI in the pod, which needs a login.
+# It lives in the pod's home volume, so it survives restarts and re-runs.
+step "Claude login"
+login="kubectl --context kind-$cluster -n $ns exec -it $pod -c t3 -- claude auth login"
+if k -n "$ns" exec "$pod" -c t3 -- claude auth status > /dev/null 2>&1; then
+  echo "already logged in"
+elif $forward && [ -t 0 ] && [ -t 1 ]; then
+  read -r -p "Log in to Claude in the pod now? It prints a link to sign in with. [Y/n] " answer || answer=n
+  case "$answer" in
+    [nN]*) echo "Later: $login" ;;
+    *) k -n "$ns" exec -it "$pod" -c t3 -- claude auth login ||
+         echo "The login didn't finish. Again with: $login" ;;
+  esac
+else
+  echo "Not logged in yet. To log in: $login"
+fi
+
 # ─── t3 ──────────────────────────────────────────────────────────────────────
 step "t3"
 pair=$(k -n "$ns" exec "$pod" -c t3 -- \
@@ -168,8 +186,8 @@ The project is on the pod, at /workspace/quickstart. Open t3 at
 
   $pair
 
-(a one-time link, valid for an hour), and log in to Claude there to start
-threads. Then try:
+(a one-time link, valid for an hour). Then try:
+  $login         # log in to Claude in the pod, for t3's Claude threads
   kubectl --context kind-$cluster -n $ns get t3projects -o yaml       # where it stands
   kubectl --context kind-$cluster -n $ns edit t3project quickstart    # change it; watch t3 follow
   kubectl --context kind-$cluster -n $ns get externalsecret           # the token: rotated every 5 minutes
