@@ -1,6 +1,6 @@
-// Writes deploy/crds.yaml and deploy/operator.yaml from deploy/render.jsonnet
-// (the library in deploy/jsonnet). With --check, writes nothing and fails if
-// either is stale. Needs a jsonnet binary: `jsonnet` on the PATH, or $JSONNET.
+// Writes deploy/install.yaml from deploy/render.jsonnet (the library in
+// deploy/jsonnet). With --check, writes nothing and fails if it is stale.
+// Needs a jsonnet binary: `jsonnet` on the PATH, or $JSONNET.
 //
 //   npm run render [-- --check]
 
@@ -12,7 +12,7 @@ import { fileURLToPath } from 'node:url';
 
 const deploy = dirname(fileURLToPath(import.meta.url));
 const check = process.argv.includes('--check');
-const outputs = ['crds.yaml', 'operator.yaml'];
+const outputs = ['install.yaml'];
 
 // The library's version is the release's: package.json's.
 const pkg = JSON.parse(readFileSync(join(deploy, '..', 'package.json'), 'utf8')).version;

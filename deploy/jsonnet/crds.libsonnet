@@ -1,4 +1,4 @@
-// The operator's CustomResourceDefinitions, the source of deploy/crds.yaml.
+// The operator's CustomResourceDefinitions, in deploy/install.yaml.
 // Their schemas follow what src/reconcile.ts reads; change both together.
 local group = 't3code.derfred.com';
 
