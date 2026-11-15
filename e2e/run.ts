@@ -46,6 +46,15 @@ const work = mkdtempSync(join(tmpdir(), 't3code-operator-e2e-'));
 const cleanups: Array<() => void> = [];
 // Run before the cleanups, on failure only: container logs.
 const diagnostics: Array<() => void> = [];
+
+// On GitHub Actions, also as an annotation: those can be read through the
+// API, where the job log may not be reachable.
+function report(title: string, text: string) {
+  console.error(`--- ${title}\n${text}`);
+  if (!process.env.GITHUB_ACTIONS) return;
+  const escaped = text.slice(-12_000).replace(/%/g, '%25').replace(/\r/g, '%0D').replace(/\n/g, '%0A');
+  console.log(`::error title=e2e ${title}::${escaped}`);
+}
 const id = `${process.pid}`;
 
 // A CA, and a certificate for the fake API server signed by it, valid for
@@ -83,7 +92,7 @@ async function startT3() {
   const name = `t3code-operator-e2e-t3-${id}`;
   docker('run', '-d', '--name', name, '-p', '127.0.0.1::3773', image, 't3', 'serve', '--host', '0.0.0.0', '--port', '3773');
   cleanups.push(() => sh('docker', ['rm', '-f', name], { quiet: true }));
-  diagnostics.push(() => console.error(`--- t3 logs\n${sh('docker', ['logs', '--tail', '50', name], { quiet: true })}`));
+  diagnostics.push(() => report('t3 logs', sh('docker', ['logs', '--tail', '50', name], { quiet: true })));
   const port = docker('port', name, '3773/tcp').split('\n')[0]!.split(':').pop()!;
   const url = `http://127.0.0.1:${port}`;
   log(`t3 (${image}) starting at ${url}`);
@@ -152,7 +161,7 @@ function startOperator(apiPort: number, ca: string, t3Token: string, t3Port: str
     '-v', `${tokenDir}:/etc/t3code/api:ro`,
     image);
   cleanups.push(() => sh('docker', ['rm', '-f', name], { quiet: true }));
-  diagnostics.push(() => console.error(`--- operator logs\n${sh('docker', ['logs', '--tail', '100', name], { quiet: true })}`));
+  diagnostics.push(() => report('operator logs', sh('docker', ['logs', '--tail', '100', name], { quiet: true })));
   log(`operator (${image}) started`);
   return undefined;
 }
@@ -186,7 +195,8 @@ try {
   ok = true;
   log('passed');
 } catch (error) {
-  console.error(`e2e: FAILED: ${error instanceof Error ? (error.stack ?? error.message) : error}`);
+  report('FAILED', error instanceof Error ? (error.stack ?? error.message) : String(error));
+  report('T3Projects', JSON.stringify(api.list(`/apis/t3code.derfred.com/v1alpha1/namespaces/${NAMESPACE}/t3projects`).map((p) => ({ name: p.metadata.name, spec: p.spec, status: p.status })), null, 1));
 } finally {
   for (const step of [...(ok ? [] : diagnostics), ...cleanups.reverse()]) {
     try {

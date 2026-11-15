@@ -13,10 +13,12 @@ import type { T3, T3Project } from './t3.ts';
 export const FINALIZER = 't3code.derfred.com/cleanup';
 // Re-apply unchanged specs this often, to repair edits made in the t3 UI.
 export const RESYNC_MS = 60 * 60 * 1000;
-// t3 does not report a failed clone to the operator, only an empty folder, so
-// a clone holds the readiness gate this long at most: a broken repository
-// must not stall every later rollout.
+// A clone holds the readiness gate this long at most. One that fails turns
+// Error, which doesn't hold it; this bounds one that never finishes.
 export const CLONE_GATE_MS = 15 * 60 * 1000;
+// A clone that failed is tried again, from the same repository, this long
+// after it failed: a network outage, or a key not yet in place, passes.
+export const CLONE_RETRY_MS = 5 * 60 * 1000;
 
 export type Phase = 'Waiting' | 'Cloning' | 'Ready' | 'Error';
 
@@ -65,6 +67,9 @@ export interface EnvironmentStatus {
   readonly appliedAt: string | null;
   readonly managesSettings: boolean;
   readonly cloningSince: string | null;
+  // The repository the latest clone started from, to tell a clone of an
+  // old URL from one of the current.
+  readonly repository: string | null;
   readonly tasks: ReadonlyArray<TaskPlacement>;
 }
 
@@ -100,6 +105,9 @@ export interface Deps {
 }
 
 export const projectIdFor = (name: string) => `k8s-${name}`;
+// The ids the operator gives a project: projectIdFor, or a fresh one after
+// it (withFreshId).
+const isOwnId = (name: string, id: string) => id === projectIdFor(name) || new RegExp(`^${projectIdFor(name)}-[0-9a-f]{8}$`).test(id);
 export const taskIdFor = (project: string, task: string) => `k8s-${project}-${task}`;
 export const workspaceRootFor = (cr: ProjectResource) => cr.spec.path ?? `/workspace/${cr.metadata.name}`;
 
@@ -118,6 +126,7 @@ export function environmentStatus(
     appliedAt: null,
     managesSettings: false,
     cloningSince: null,
+    repository: null,
     tasks: [],
     ...fields,
   };
@@ -189,14 +198,43 @@ async function removeFinalizer(deps: Deps, cr: ProjectResource) {
 
 // ─── the project on one environment ──────────────────────────────────────────
 
-function startClone(t3: T3, cr: ProjectResource, projectId: string, now: Date) {
-  return t3.call('projectClone.start', {
+// Starts a clone; resolves to the id t3 registered the project under.
+async function startClone(t3: T3, cr: ProjectResource, projectId: string, now: Date): Promise<string> {
+  const started = (await t3.call('projectClone.start', {
     projectId,
     title: cr.spec.title ?? cr.metadata.name,
     createdAt: now.toISOString(),
     remoteUrl: cr.spec.repository,
     destinationPath: workspaceRootFor(cr),
-  }) as Promise<{ projectId?: string }>;
+  })) as { projectId?: string } | undefined;
+  return started?.projectId ?? projectId;
+}
+
+// t3 never takes a deleted project's id again. A project deleted before
+// (deletionPolicy Delete, or a failed clone started over) comes back under a
+// fresh one; the status records it, and a lost status finds it by path.
+async function withFreshId<T>(name: string, attempt: (projectId: string) => Promise<T>): Promise<T> {
+  try {
+    return await attempt(projectIdFor(name));
+  } catch (error) {
+    if (!/cannot be created twice/i.test(errorMessage(error))) throw error;
+    return attempt(`${projectIdFor(name)}-${randomUUID().slice(0, 8)}`);
+  }
+}
+
+// t3's record of a clone it ran for the project, while it keeps one: a
+// running or failed clone until the project goes, a finished one briefly.
+export interface CloneSnapshot {
+  readonly projectId: string;
+  readonly remoteUrl: string;
+  readonly phase: 'running' | 'done' | 'failed' | 'cancelled';
+  readonly error: string | null;
+  readonly endedAt: string | null;
+}
+
+async function cloneOf(t3: T3, projectId: string): Promise<CloneSnapshot | undefined> {
+  const clones = (await t3.first('subscribeProjectClones', {})) as ReadonlyArray<CloneSnapshot> | undefined;
+  return clones?.find((c) => c.projectId === projectId);
 }
 
 async function syncProject(
@@ -219,6 +257,15 @@ async function syncProject(
     tasks: previous?.tasks ?? [],
   };
   const cloningSince = previous?.phase === 'Cloning' && previous.cloningSince ? previous.cloningSince : now.toISOString();
+  const cloning = (projectId: string, repository: string, since = cloningSince) =>
+    environmentStatus({
+      ...carried,
+      phase: 'Cloning',
+      cloningSince: since,
+      projectId,
+      repository,
+      message: `cloning ${repository} into ${root}`,
+    });
 
   const live = (await t3.listProjects()).filter((p) => p.deletedAt === null);
   // Prefer the id this environment already uses; else adopt a project
@@ -227,21 +274,17 @@ async function syncProject(
     live.find((p) => p.id === (previous?.projectId ?? projectIdFor(name))) ?? live.find((p) => p.workspaceRoot === root);
 
   if (!project) {
-    const projectId = projectIdFor(name);
     try {
-      const started = await startClone(t3, cr, projectId, now);
-      return environmentStatus({
-        ...carried,
-        phase: 'Cloning',
-        cloningSince,
-        projectId: started?.projectId ?? projectId,
-        message: `cloning ${cr.spec.repository} into ${root}`,
-      });
+      const started = await withFreshId(name, (id) => startClone(t3, cr, id, now));
+      return cloning(started, cr.spec.repository);
     } catch (error) {
       // A checkout already on disk is registered as it is, not re-cloned.
       if (!/not empty/i.test(errorMessage(error))) throw error;
-      await t3.mutateProject({ type: 'project.create', commandId: randomUUID(), projectId, title, workspaceRoot: root });
-      project = { id: projectId };
+      const id = await withFreshId(name, async (id) => {
+        await t3.mutateProject({ type: 'project.create', commandId: randomUUID(), projectId: id, title, workspaceRoot: root });
+        return id;
+      });
+      project = { id };
     }
   }
   const projectId = project.id;
@@ -252,24 +295,21 @@ async function syncProject(
   if (previous?.phase !== 'Ready' || previous.projectId !== projectId) {
     const listing = (await t3.call('projects.listEntries', { cwd: root })) as { entries: ReadonlyArray<unknown> };
     if (listing.entries.length === 0) {
+      const clone = await cloneOf(t3, projectId);
+      if (clone?.phase === 'failed' || clone?.phase === 'cancelled') {
+        return failedClone(deps, cr, t3, clone, previous, cloning, carried);
+      }
       // Empty to the listing, which skips .git, is also a clone under way:
       // git has written .git but checked nothing out yet. t3 checks the
       // destination before it looks for a running clone, so that start
       // fails "not empty" rather than "in progress". Both mean: still
-      // cloning. So is a failed clone that left .git behind: like a clone
-      // that never finishes, it holds the gate CLONE_GATE_MS at most.
+      // cloning.
       try {
         await startClone(t3, cr, projectId, now);
       } catch (error) {
         if (!/in progress|not empty/i.test(errorMessage(error))) throw error;
       }
-      return environmentStatus({
-        ...carried,
-        phase: 'Cloning',
-        cloningSince,
-        projectId,
-        message: `cloning ${cr.spec.repository} into ${root}`,
-      });
+      return cloning(projectId, previous?.repository ?? cr.spec.repository);
     }
   }
 
@@ -303,7 +343,42 @@ async function syncProject(
     projectId,
     managesSettings,
     ...applied,
-    message: projectId === projectIdFor(name) ? null : `adopted existing project ${projectId}`,
+    message: isOwnId(name, projectId) ? null : `adopted existing project ${projectId}`,
+  });
+}
+
+// A clone t3 gave up on: Error with git's message, which doesn't hold the
+// readiness gate. Retried from the same repository after CLONE_RETRY_MS. A
+// changed repository can't be retried (t3 would clone the old one again),
+// so the project, which has no files yet, is deleted, and with it the failed
+// clone and its folder, and the new repository cloned under a fresh id.
+async function failedClone(
+  deps: Deps,
+  cr: ProjectResource,
+  t3: T3,
+  clone: CloneSnapshot,
+  previous: EnvironmentStatus | undefined,
+  cloning: (projectId: string, repository: string, since?: string) => EnvironmentStatus,
+  carried: Pick<EnvironmentStatus, 'name' | 'environmentSet' | 'podUID' | 'managesSettings' | 'tasks'>,
+): Promise<EnvironmentStatus> {
+  const now = deps.now();
+  const from = previous?.repository ?? clone.remoteUrl;
+  if (from !== cr.spec.repository) {
+    await t3.mutateProject({ type: 'project.delete', commandId: randomUUID(), projectId: clone.projectId, force: true });
+    const started = await withFreshId(cr.metadata.name, (id) => startClone(t3, cr, id, now));
+    return cloning(started, cr.spec.repository, now.toISOString());
+  }
+  const failedAt = clone.endedAt === null ? 0 : Date.parse(clone.endedAt);
+  if (now.getTime() - failedAt >= CLONE_RETRY_MS) {
+    await t3.call('projectClone.retry', { projectId: clone.projectId });
+    return cloning(clone.projectId, from, now.toISOString());
+  }
+  return environmentStatus({
+    ...carried,
+    phase: 'Error',
+    projectId: clone.projectId,
+    repository: from,
+    message: `clone of ${from} ${clone.phase === 'cancelled' ? 'cancelled' : 'failed'}: ${clone.error ?? 'no detail'}`,
   });
 }
 

@@ -89,7 +89,9 @@ surface to keep in sync.
 ## Identity
 
 - **IDs:** a project's ID is `k8s-<project>`; a task's is
-  `k8s-<project>-<task>`.
+  `k8s-<project>-<task>`. t3 never takes the ID of a deleted project again,
+  so a project deleted before (`deletionPolicy: Delete`, or a failed clone
+  started over) comes back as `k8s-<project>-<8 hex digits>`.
 - **Finding the project** on an environment, in order:
   1. the ID recorded in that environment's status entry;
   2. `k8s-<project>`;
@@ -135,10 +137,18 @@ Each pass:
       background. If the folder already has files ("not empty"), register the
       checkout as it is with `project.create`.
    2. **Wait for the clone.** Until that environment reports `Ready`, check
-      the checkout has files (`projects.listEntries`). An empty folder is a
-      clone still running, or one that failed or was forgotten by a restart.
-      Call `projectClone.start` again: t3 reuses the project, or answers
-      "already in progress".
+      the checkout has files (`projects.listEntries`, which doesn't list
+      `.git`). For an empty folder, read t3's record of the clone (the first
+      message of `subscribeProjectClones`):
+      - **Failed:** the entry turns `Error` with git's message. From the same
+        repository, `projectClone.retry` after 5 minutes. From a changed one,
+        t3's retry would clone the old URL again: delete the project, which
+        has no files and takes the failed clone and its folder with it, and
+        clone the new repository under a fresh ID.
+      - **Otherwise** it's a clone still running, or one a restart forgot.
+        Call `projectClone.start` again: t3 reuses the project, or answers
+        "already in progress", or "not empty" while git has written only
+        `.git`.
    3. **Apply the spec:** `project.update` (`spec.project`, the title,
       `archived: false`), then `server.updateSettings` with
       `projectSettingsOverrides[id] = spec.settings`. This runs only when
@@ -170,11 +180,9 @@ Each pass:
 4. **Readiness.** For each environment, `content-ready` is true when no
    project placed there is still on its way: `Waiting`, or `Cloning` for up to
    15 minutes. An `Error` does not hold the gate: it's in status for a person
-   to fix, and holding the gate on it would stall every later rollout. The
-   15-minute bound exists for the same reason: t3 doesn't tell the operator
-   that a clone failed, only that the folder is still empty, so a broken
-   repository would otherwise look like a clone in progress forever. The gate
-   is written only when it changes.
+   to fix, and holding the gate on it would stall every later rollout. A
+   failed clone is an `Error`; the 15-minute bound is for one that never
+   finishes. The gate is written only when it changes.
 
 **Status:**
 - **T3Project:** `phase` (`Ready`, `Progressing`, `Error`, `Waiting`,
@@ -214,7 +222,7 @@ follows `deletionPolicy`:
 | Situation | What happens |
 |---|---|
 | A pod is down or not up | That environment's entry is `Waiting`; the others proceed. |
-| The clone fails (bad URL, no access, egress allowlist) | `Cloning`, retried every few seconds. The gate holds for 15 minutes from the first attempt, then lets the rollout go on. The reason is in t3's clone list, not yet in the status. |
+| The clone fails (bad URL, no access, egress allowlist) | `Error` with git's message; the gate doesn't wait. Retried every 5 minutes from the same repository; a changed `repository` starts over at once, under a fresh project ID. |
 | t3 rejects a field | That environment's entry is `Error` with t3's message. The gate stays open; the next pass retries. |
 | The operator is down | Nothing changes in the environments. **New or restarted pods stay not-Ready, so a rollout stalls** , while the tailnet access stays up. On restart, one pass catches up. |
 | The token is wrong, or t3 is older than `--auth-token-file` | Every environment is `Error: HTTP 401`. |

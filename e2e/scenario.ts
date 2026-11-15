@@ -121,6 +121,40 @@ export async function run({ api, t3, podIP, remote, workspace }: Context): Promi
   await until('the changed override in t3', 10_000, async () => (await overrideOf(t3, 'k8s-e2e'))?.branchNamePrefix === 'changed/');
   step(`a spec change reached t3 in ${Date.now() - started}ms`);
 
+  // A repository git can't clone: t3 reports the failure (read from its
+  // clone stream), and the project turns Error without holding the gate.
+  // Fixing the URL starts it over under a fresh id: t3 never takes the
+  // deleted one again.
+  api.create(projects, {
+    metadata: { name: 'fixme' },
+    spec: {
+      repository: `${remote}-missing`,
+      path: `${workspace}/fixme`,
+      environmentSetSelector: { matchLabels: { trust: 'test' } },
+      deletionPolicy: 'Delete',
+    },
+  });
+  const failed = await until('the failed clone to be Error', 30_000, () => {
+    const env = api.get(projects, 'fixme')?.status?.environments?.[0];
+    return env?.phase === 'Error' ? env : undefined;
+  });
+  assert.match(failed.message, /^clone of .*-missing failed: /);
+  assert.equal(gate(), 'True', 'an Error does not hold the gate');
+  step(`a failed clone is Error: ${failed.message}`);
+
+  api.patch(projects, 'fixme', { spec: { repository: remote } });
+  const fixed = await until('the fixed project to be Ready', 60_000, () => {
+    const env = api.get(projects, 'fixme')?.status?.environments?.[0];
+    return env?.phase === 'Ready' ? env : undefined;
+  });
+  assert.match(fixed.projectId, /^k8s-fixme-[0-9a-f]{8}$/);
+  const live = (await t3.listProjects()).filter((p) => p.workspaceRoot === `${workspace}/fixme` && p.deletedAt === null);
+  assert.deepEqual(live.map((p) => p.id), [fixed.projectId], 'one project at the path: the failed one went');
+  step(`fixing the repository cloned it as ${fixed.projectId}`);
+
+  api.delete(projects, 'fixme');
+  await until('the fixme T3Project to be gone', 30_000, () => api.get(projects, 'fixme') === undefined);
+
   api.delete(projects, 'e2e');
   await until('the T3Project to be gone', 30_000, () => api.get(projects, 'e2e') === undefined);
   const archived = (await t3.listProjects()).find((p) => p.id === 'k8s-e2e');

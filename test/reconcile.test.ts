@@ -3,6 +3,7 @@ import { describe, it } from 'node:test';
 import type { Environment, Kube } from '../src/kube.ts';
 import {
   CLONE_GATE_MS,
+  CLONE_RETRY_MS,
   canonical,
   FINALIZER,
   RESYNC_MS,
@@ -11,6 +12,7 @@ import {
   pickOne,
   reconcileEnvironmentSet,
   reconcileProject,
+  type CloneSnapshot,
   type EnvironmentSetResource,
   type PlacedSet,
   type ProjectResource,
@@ -27,6 +29,10 @@ class FakeT3 implements T3 {
   // Clones that have written .git, which projects.listEntries doesn't list.
   gitWritten = new Set<string>();
   existingCheckouts = new Set<string>();
+  // t3's clone records, by project id (subscribeProjectClones), and the ids
+  // of deleted projects, which t3 never takes again.
+  clones = new Map<string, CloneSnapshot>();
+  deletedIds = new Set<string>();
   overrides: Record<string, unknown> = {};
   tasks = new Map<string, Record<string, unknown>>();
   calls: Array<{ method: string; payload: any }> = [];
@@ -37,13 +43,22 @@ class FakeT3 implements T3 {
   async mutateProject(m: any) {
     this.calls.push({ method: m.type, payload: m });
     if (m.type === 'project.create') {
+      this.takeId(m.projectId);
       this.projects.push({ id: m.projectId, title: m.title, workspaceRoot: m.workspaceRoot, deletedAt: null });
     } else if (m.type === 'project.update') {
       const project = this.projects.find((p) => p.id === m.projectId);
       if (!project) throw new T3Error('Project not found');
       Object.assign(project, { title: m.title ?? project.title, archived: m.archived, pinned: m.pinned });
     } else if (m.type === 'project.delete') {
+      const project = this.projects.find((p) => p.id === m.projectId);
       this.projects = this.projects.filter((p) => p.id !== m.projectId);
+      this.deletedIds.add(m.projectId);
+      // t3 discards the project's clone with it, and its partial folder.
+      this.clones.delete(m.projectId);
+      if (project) {
+        this.cloning.delete(project.workspaceRoot);
+        this.gitWritten.delete(project.workspaceRoot);
+      }
     }
   }
   async call(method: string, payload: any): Promise<any> {
@@ -54,12 +69,29 @@ class FakeT3 implements T3 {
         if (this.existingCheckouts.has(payload.destinationPath) || this.gitWritten.has(payload.destinationPath)) {
           throw new T3Error('Destination path already exists and is not empty.');
         }
-        if (this.cloning.has(payload.destinationPath)) throw new T3Error('A clone into this destination is already in progress.');
+        const claimed = [...this.clones.values()].some((c) => c.projectId === payload.projectId);
+        if (this.cloning.has(payload.destinationPath) || claimed) {
+          throw new T3Error('A clone into this destination is already in progress.');
+        }
         if (!this.projects.some((p) => p.workspaceRoot === payload.destinationPath)) {
+          this.takeId(payload.projectId);
           this.projects.push({ id: payload.projectId, title: payload.title, workspaceRoot: payload.destinationPath, deletedAt: null });
         }
         this.cloning.add(payload.destinationPath);
+        this.clones.set(payload.projectId, {
+          projectId: payload.projectId,
+          remoteUrl: payload.remoteUrl,
+          phase: 'running',
+          error: null,
+          endedAt: null,
+        });
         return { projectId: payload.projectId };
+      }
+      case 'projectClone.retry': {
+        const clone = this.clones.get(payload.projectId);
+        if (!clone || (clone.phase !== 'failed' && clone.phase !== 'cancelled')) return { applied: false };
+        this.clones.set(payload.projectId, { ...clone, phase: 'running', error: null, endedAt: null });
+        return { applied: true };
       }
       case 'projects.listEntries':
         return { entries: Array.from({ length: this.files.get(payload.cwd) ?? 0 }, () => ({})) };
@@ -75,7 +107,24 @@ class FakeT3 implements T3 {
     }
     throw new Error(`unexpected call ${method}`);
   }
+  async first(method: string, payload: any): Promise<any> {
+    this.calls.push({ method, payload });
+    if (method === 'subscribeProjectClones') return [...this.clones.values()];
+    throw new Error(`unexpected stream ${method}`);
+  }
   close() {}
+  takeId(id: string) {
+    if (this.deletedIds.has(id) || this.projects.some((p) => p.id === id)) {
+      throw new T3Error(`Project '${id}' already exists and cannot be created twice.`);
+    }
+  }
+  // git gave up on the clone into the project.
+  failClone(projectId: string, error: string, endedAt: string) {
+    const clone = this.clones.get(projectId)!;
+    this.clones.set(projectId, { ...clone, phase: 'failed', error, endedAt });
+    const project = this.projects.find((p) => p.id === projectId);
+    if (project) this.cloning.delete(project.workspaceRoot);
+  }
   // A project that is already cloned and registered.
   seed(id = 'k8s-infra', root = '/workspace/infra') {
     this.projects.push({ id, title: 'infra', workspaceRoot: root, deletedAt: null });
@@ -257,6 +306,69 @@ describe('reconcileProject on an environment', () => {
     assert.equal(update.autoPull, true);
     assert.equal(update.archived, false);
     assert.deepEqual(t3.overrides, { 'k8s-infra': { branchNamePrefix: 'bz/' } });
+  });
+
+  it('reports a failed clone as Error with git\'s message, and retries it later', async () => {
+    const { deps, kube, world, server, advance } = setup(one());
+    const t3 = server('bugzoo-0');
+    let cr = project();
+    await reconcileProject(deps, cr, world());
+    t3.failClone('k8s-infra', 'ERROR: Repository not found.', deps.now().toISOString());
+
+    await reconcileProject(deps, (cr = observed(cr, kube)), world());
+    let status = envStatus(kube, 'bugzoo-0');
+    assert.equal(status.phase, 'Error');
+    assert.equal(status.message, 'clone of git@github.com:derfred/infra.git failed: ERROR: Repository not found.');
+    assert.equal(holdsGate({ phase: status.phase, cloningSince: status.cloningSince }, deps.now()), false, 'an Error does not hold the gate');
+
+    await reconcileProject(deps, (cr = observed(cr, kube)), world());
+    assert.equal(t3.methods().filter((m) => m === 'projectClone.retry').length, 0, 'not retried straight away');
+
+    advance(CLONE_RETRY_MS);
+    await reconcileProject(deps, (cr = observed(cr, kube)), world());
+    status = envStatus(kube, 'bugzoo-0');
+    assert.equal(status.phase, 'Cloning');
+    assert.equal(status.projectId, 'k8s-infra');
+    assert.deepEqual(t3.calls.find((c) => c.method === 'projectClone.retry')!.payload, { projectId: 'k8s-infra' });
+  });
+
+  it('starts a failed clone over from a changed repository, under a fresh id', async () => {
+    const { deps, kube, world, server } = setup(one());
+    const t3 = server('bugzoo-0');
+    let cr = project({ repository: 'git@github.com:derfred/typo.git' });
+    await reconcileProject(deps, cr, world());
+    assert.equal(envStatus(kube, 'bugzoo-0').repository, 'git@github.com:derfred/typo.git');
+    t3.failClone('k8s-infra', 'ERROR: Repository not found.', deps.now().toISOString());
+    await reconcileProject(deps, (cr = observed(cr, kube)), world());
+    assert.equal(envStatus(kube, 'bugzoo-0').phase, 'Error');
+
+    cr = observed({ ...cr, spec: { ...cr.spec, repository: 'git@github.com:derfred/infra.git' } }, kube);
+    await reconcileProject(deps, cr, world());
+    const status = envStatus(kube, 'bugzoo-0');
+    assert.equal(status.phase, 'Cloning');
+    assert.equal(status.repository, 'git@github.com:derfred/infra.git');
+    assert.match(status.projectId!, /^k8s-infra-[0-9a-f]{8}$/, 't3 never takes the deleted id again');
+    assert.deepEqual(
+      t3.calls.filter((c) => c.method === 'project.delete').map((c) => c.payload.projectId),
+      ['k8s-infra'],
+      'the failed project, with no files, is deleted',
+    );
+    assert.equal(t3.clones.get(status.projectId!)!.remoteUrl, 'git@github.com:derfred/infra.git');
+
+    t3.cloning.clear();
+    t3.files.set('/workspace/infra', 3);
+    await reconcileProject(deps, observed(cr, kube), world());
+    assert.equal(envStatus(kube, 'bugzoo-0').phase, 'Ready');
+    assert.equal(envStatus(kube, 'bugzoo-0').message, null, 'its own project, not an adopted one');
+  });
+
+  it('clones a project recreated after a Delete under a fresh id', async () => {
+    const { deps, kube, world, server } = setup(one());
+    const t3 = server('bugzoo-0');
+    t3.deletedIds.add('k8s-infra');
+    await reconcileProject(deps, project(), world());
+    assert.match(envStatus(kube, 'bugzoo-0').projectId!, /^k8s-infra-[0-9a-f]{8}$/);
+    assert.equal(envStatus(kube, 'bugzoo-0').phase, 'Cloning');
   });
 
   it('re-applies only on a spec change, a new pod, or the resync interval', async () => {

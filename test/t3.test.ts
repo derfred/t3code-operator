@@ -14,6 +14,15 @@ function pendingCall() {
 }
 
 describe('settleFrame', () => {
+  it('settles a stream call with the first value of its first Chunk', () => {
+    const { pending, outcome } = pendingCall();
+    assert.equal(settleFrame({ _tag: 'Chunk', requestId: '1', values: [[{ projectId: 'p' }], [{ projectId: 'q' }]] }, pending), true);
+    assert.deepEqual(outcome.value, [{ projectId: 'p' }]);
+    assert.equal(pending.size, 0);
+    // The stream's Exit, after the interrupt, answers nothing.
+    assert.equal(settleFrame({ _tag: 'Exit', requestId: '1', exit: { _tag: 'Success', value: null } }, pending), false);
+  });
+
   it('resolves a successful Exit with its value', () => {
     const { pending, outcome } = pendingCall();
     assert.equal(settleFrame({ _tag: 'Exit', requestId: '1', exit: { _tag: 'Success', value: { ok: 1 } } }, pending), true);

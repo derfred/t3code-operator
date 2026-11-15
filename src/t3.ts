@@ -3,8 +3,9 @@
 //
 // The RPC is Effect RPC with JSON serialization: one JSON message per frame,
 // a request is {_tag: 'Request', id, tag, payload, headers}, and the server
-// answers with {_tag: 'Exit', requestId, exit}. Only unary methods are used
-// here, so stream chunks, acks and interrupts never come up.
+// answers with {_tag: 'Exit', requestId, exit}. A stream answers with
+// {_tag: 'Chunk', requestId, values} frames first; `first` takes the first
+// value of the first chunk and interrupts the stream, so acks never come up.
 
 export interface T3Project {
   readonly id: string;
@@ -18,6 +19,9 @@ export interface T3 {
   listProjects(): Promise<ReadonlyArray<T3Project>>;
   mutateProject(mutation: Record<string, unknown>): Promise<void>;
   call(method: string, payload: unknown): Promise<unknown>;
+  // A stream method's first value (subscriptions start with the current
+  // state); undefined if the stream ends without one.
+  first(method: string, payload: unknown): Promise<unknown>;
   close(): void;
 }
 
@@ -59,8 +63,18 @@ export function describeFailure(cause: unknown): T3Error {
 }
 
 // Settles the pending call a frame answers. Returns false for frames that
-// answer nothing (Pong, or a response to a call that already timed out).
+// answer nothing (Pong, or a response to a call that already timed out or
+// took its first chunk). A Chunk settles the call with its first value.
 export function settleFrame(frame: any, pending: Map<string, Pending>): boolean {
+  if (frame?._tag === 'Chunk') {
+    const id = String(frame.requestId);
+    const call = pending.get(id);
+    if (!call) return false;
+    pending.delete(id);
+    clearTimeout(call.timer);
+    call.resolve(Array.isArray(frame.values) ? frame.values[0] : undefined);
+    return true;
+  }
   if (frame?._tag === 'Defect') {
     for (const [id, call] of pending) {
       clearTimeout(call.timer);
@@ -118,7 +132,11 @@ export function makeT3(origin: string, token: string): T3 {
     });
     ws.addEventListener('message', (event) => {
       const decoded = JSON.parse(String(event.data));
-      for (const frame of Array.isArray(decoded) ? decoded : [decoded]) settleFrame(frame, pending);
+      for (const frame of Array.isArray(decoded) ? decoded : [decoded]) {
+        settleFrame(frame, pending);
+        // Only ever the first chunk is wanted: stop the stream.
+        if (frame?._tag === 'Chunk') ws.send(JSON.stringify({ _tag: 'Interrupt', requestId: frame.requestId }));
+      }
     });
     ws.addEventListener('close', () => {
       socket = undefined;
@@ -127,30 +145,34 @@ export function makeT3(origin: string, token: string): T3 {
     return ws;
   };
 
+  // One request: settled by its Exit, or by a stream's first Chunk.
+  const request = async (method: string, payload: unknown): Promise<unknown> => {
+    socket ??= connect();
+    let ws: WebSocket;
+    try {
+      ws = await socket;
+    } catch (error) {
+      socket = undefined;
+      throw error;
+    }
+    const id = String(++nextId);
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        pending.delete(id);
+        reject(new T3Error(`${method} timed out`));
+      }, CALL_TIMEOUT_MS);
+      pending.set(id, { resolve, reject, timer });
+      ws.send(JSON.stringify({ _tag: 'Request', id, tag: method, payload, headers: [] }));
+    });
+  };
+
   return {
     listProjects: async () => (await http('GET', '/api/projects')).projects,
     mutateProject: async (mutation) => {
       await http('POST', '/api/projects/mutate', mutation);
     },
-    call: async (method, payload) => {
-      socket ??= connect();
-      let ws: WebSocket;
-      try {
-        ws = await socket;
-      } catch (error) {
-        socket = undefined;
-        throw error;
-      }
-      const id = String(++nextId);
-      return new Promise((resolve, reject) => {
-        const timer = setTimeout(() => {
-          pending.delete(id);
-          reject(new T3Error(`${method} timed out`));
-        }, CALL_TIMEOUT_MS);
-        pending.set(id, { resolve, reject, timer });
-        ws.send(JSON.stringify({ _tag: 'Request', id, tag: method, payload, headers: [] }));
-      });
-    },
+    call: request,
+    first: request,
     close: () => {
       const current = socket;
       socket = undefined;

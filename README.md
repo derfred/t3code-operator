@@ -74,6 +74,10 @@ stands; each resource's status lists every environment with its phase
   finalizer holds it until done). `Archive` keeps threads and files; `Delete`
   removes the project and its threads; `Retain` leaves it. Checkouts are never
   deleted from disk.
+- **Failed clones**: the environment's entry turns `Error` with git's message,
+  and is retried every 5 minutes. Fix `repository` and it starts over at
+  once: the failed project, which has no files, is deleted and the new
+  repository cloned.
 - **Tasks**: `placement: One` puts the task on a single environment, which
   keeps it across pod restarts (its thread lives there); `EachEnvironment` on
   all, so it runs once per environment. A task's own `environmentSetSelector`

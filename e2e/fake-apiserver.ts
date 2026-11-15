@@ -117,6 +117,10 @@ export class FakeApiServer {
     return clone(this.#store(collection, next, undefined));
   }
 
+  list(collection: string): Obj[] {
+    return [...this.#collection(collection).values()].map(clone);
+  }
+
   get(collection: string, name: string): Obj | undefined {
     const o = this.#collection(collection).get(name);
     return o && clone(o);
