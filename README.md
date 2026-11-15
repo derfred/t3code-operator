@@ -16,6 +16,21 @@ The operator never creates or changes the StatefulSets: they stay yours. It
 reads them, talks to t3 on each pod, and sets one pod condition. Design and
 trade-offs: [docs/design.md](docs/design.md).
 
+## Try it locally
+
+With Docker, [kind](https://kind.sigs.k8s.io) and kubectl:
+
+```sh
+examples/quickstart.sh --dockerfile examples/Dockerfile
+```
+
+One command: a kind cluster, a t3 image built from source (the minimal
+[`images/t3`](images/t3/Dockerfile), plus Node and Claude Code from
+[`examples/Dockerfile`](examples/Dockerfile)), the operator, one t3 pod, and
+a project it clones there. It ends with a link to open t3 on localhost.
+Leave out `--dockerfile` for the minimal image alone; `--delete` removes it
+all. `examples/Dockerfile` is also the place to start your own image.
+
 ## Install
 
 ```sh
