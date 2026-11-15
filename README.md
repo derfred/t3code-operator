@@ -184,9 +184,10 @@ generator and an `ExternalSecret` with a `refreshInterval` write a fresh token
 into `t3code-operator-tokens`, and the pods mount their key of that same
 Secret, so both sides always read the same token.
 [`examples/quickstart/tokens.yaml`](examples/quickstart/tokens.yaml) rotates
-every 5 minutes; while the kubelet updates the mounted files (about a minute),
-the operator's calls may be refused, and it simply tries again on its next
-pass.
+every 5 minutes. The kubelet updates each pod's mounted copy on its own
+schedule, from seconds to a few minutes, so for a while after each rotation
+the operator's calls may be refused; it simply tries again on its next pass.
+Rotate less often where that matters.
 
 **2. A session token from upstream t3.** Any T3 Code (for example `t3` from
 npm, as in [`e2e/t3.Dockerfile`](e2e/t3.Dockerfile)) issues bearer tokens

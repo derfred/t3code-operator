@@ -76,7 +76,9 @@ jobs:
           k annotate externalsecret t3code-operator-tokens force-sync="$(date +%s)" --overwrite
           until_ 60 "a new token in the Secret" sh -c "[ \"\$(kubectl --context kind-t3code-quickstart -n t3code get secret t3code-operator-tokens -o jsonpath='{.data.t3code-quickstart}' | base64 --decode)\" != '$old' ]"
           new=$(secret)
-          until_ 150 "the new token in the pod's file" sh -c "[ \"\$(kubectl --context kind-t3code-quickstart -n t3code exec t3code-quickstart-0 -c t3 -- cat /etc/t3code/api/token)\" = '$new' ]"
+          # The kubelet updates a mounted Secret on its own schedule: seconds, or
+          # a few minutes.
+          until_ 300 "the new token in the pod's file" sh -c "[ \"\$(kubectl --context kind-t3code-quickstart -n t3code exec t3code-quickstart-0 -c t3 -- cat /etc/t3code/api/token)\" = '$new' ]"
           hash() { k get t3project quickstart -o jsonpath='{.status.environments[0].appliedHash}'; }
           before=$(hash)
           k patch t3project quickstart --type=merge -p '{"spec":{"project":{"pinned":false}}}'

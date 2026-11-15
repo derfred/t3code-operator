@@ -4,8 +4,9 @@
 # operator mounts it whole (one key per StatefulSet, named after it), the t3
 # pods mount their key as T3CODE_AUTH_TOKEN_FILE (t3.yaml). Neither needs a
 # restart: the kubelet updates the mounted files, t3 re-reads its own, and the
-# operator reads its own on every pass. Until both have the new one (about a
-# minute) the operator's calls may be refused, and it tries again.
+# operator reads its own on every pass. Until both have the new one (the
+# kubelet takes seconds to a few minutes) the operator's calls may be
+# refused, and it tries again.
 apiVersion: generators.external-secrets.io/v1alpha1
 kind: Password
 metadata:
