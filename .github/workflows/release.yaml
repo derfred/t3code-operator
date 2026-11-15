@@ -1,0 +1,112 @@
+name: release
+
+# Publishes release vX.Y.Z, on pushing that tag: the image
+# ghcr.io/derfred/t3code-operator:X.Y.Z and a GitHub release. The tag is also
+# the release of the jsonnet library (deploy/jsonnet@vX.Y.Z, whose default
+# image is X.Y.Z) and of deploy/install.yaml at that tag.
+#
+# Releasing: set the version in package.json and deploy/jsonnet/version.json
+# (`npm run render -- --check` keeps them equal), merge, then tag the merge:
+#
+#   git tag -a vX.Y.Z -m vX.Y.Z && git push origin vX.Y.Z
+#
+# The image is tested before it is pushed: unit tests, the render check, and
+# the end-to-end test against that very build.
+
+on:
+  push:
+    tags: ["v*"]
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  packages: write
+
+env:
+  IMAGE: ghcr.io/derfred/t3code-operator
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: The tag is the version
+        id: v
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::tag $GITHUB_REF_NAME is not vX.Y.Z"; exit 1; }
+          pkg=$(jq -r .version package.json)
+          lib=$(jq -r .version deploy/jsonnet/version.json)
+          if [ "$pkg" != "$version" ] || [ "$lib" != "$version" ]; then
+            echo "::error::tag $GITHUB_REF_NAME, but package.json says $pkg and deploy/jsonnet/version.json $lib"; exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Release images are immutable: a cluster pulls X.Y.Z with IfNotPresent,
+      # so a rebuilt X.Y.Z would never reach a node that already has it.
+      - name: Refuse to overwrite a release image
+        env:
+          VERSION: ${{ steps.v.outputs.version }}
+        run: |
+          if docker buildx imagetools inspect "$IMAGE:$VERSION" > /dev/null 2>&1; then
+            echo "::error::$IMAGE:$VERSION already exists"; exit 1
+          fi
+
+      - name: Unit tests
+        run: npm test
+      - name: Rendered manifests are up to date
+        run: |
+          go install github.com/google/go-jsonnet/cmd/jsonnet@v0.21.0
+          JSONNET="$(go env GOPATH)/bin/jsonnet" npm run render -- --check
+
+      - uses: docker/setup-buildx-action@v3
+
+      # Built once into the local Docker for the end-to-end test; the push
+      # below reuses the cached layers for amd64 and adds arm64 (the image has
+      # no RUN step, so arm64 needs no emulation).
+      - name: Build the image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          tags: t3code-operator:release
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - name: End-to-end, against that image
+        run: npm run e2e -- --operator-image t3code-operator:release
+
+      - name: Push the image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          platforms: linux/amd64,linux/arm64
+          tags: |
+            ${{ env.IMAGE }}:${{ steps.v.outputs.version }}
+            ${{ env.IMAGE }}:sha-${{ github.sha }}
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ steps.v.outputs.version }}
+          cache-from: type=gha
+
+      - name: GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.v.outputs.version }}
+        run: |
+          gh release create "v$VERSION" --verify-tag --generate-notes --title "v$VERSION" deploy/install.yaml

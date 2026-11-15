@@ -273,6 +273,14 @@ fails on a stale render, and on `deploy/jsonnet/version.json` disagreeing with
 CI (`.github/workflows/test.yaml`) runs all three checks on every push and
 pull request.
 
+**Releasing** vX.Y.Z: set the version in `package.json` and
+`deploy/jsonnet/version.json`, merge, and push the tag (`git tag -a vX.Y.Z -m
+vX.Y.Z && git push origin vX.Y.Z`). `.github/workflows/release.yaml` then
+runs the checks, the end-to-end test against the image it built, pushes
+`ghcr.io/derfred/t3code-operator:X.Y.Z` (amd64 and arm64), and creates the
+GitHub release with `install.yaml` attached. The library at that tag defaults
+to that image.
+
 The end-to-end test (`e2e/run.ts`) runs the **production image**, built from
 the checkout, against a fake Kubernetes API server (`e2e/fake-apiserver.ts`:
 HTTPS, watches, merge and strategic-merge patches, the status subresource,
