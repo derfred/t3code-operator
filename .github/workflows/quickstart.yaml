@@ -53,11 +53,24 @@ jobs:
           until_() { # until_ SECONDS DESCRIPTION COMMAND...
             local deadline=$((SECONDS + $1)) what=$2; shift 2
             until "$@"; do
-              [ $SECONDS -lt $deadline ] || { echo "timed out waiting for $what" >&2; return 1; }
+              [ $SECONDS -lt $deadline ] || { report "timed out waiting for $what"; return 1; }
               sleep 3
             done
             echo "$what"
           }
+          # As annotations, which the run's summary shows without its log.
+          report() {
+            set +e; trap - ERR
+            local file sec
+            sec=$(k get secret t3code-operator-tokens -o jsonpath='{.data.t3code-quickstart}' | base64 --decode | cut -c1-8)
+            file=$(k exec t3code-quickstart-0 -c t3 -- cat /etc/t3code/api/token 2>&1 | cut -c1-8)
+            echo "::error title=rotation::$1 (Secret ${sec}…, pod file ${file}…)"
+            echo "::error title=status::$(k get t3project quickstart -o jsonpath='{.status.environments[0]}' | tr -d '\n' | cut -c1-900)"
+            echo "::error title=externalsecret::$(k get externalsecret t3code-operator-tokens -o jsonpath='{.status.conditions}' | cut -c1-600)"
+            echo "::error title=operator::$(k logs deploy/t3code-operator --tail 8 2>&1 | cut -c1-200 | tr '\n' '|' | cut -c1-1500)"
+            echo "::error title=t3::$(k logs t3code-quickstart-0 -c t3 --tail 40 2>&1 | grep -iE 'token|auth|401|warn|error' | tail -6 | cut -c1-200 | tr '\n' '|')"
+          }
+          trap 'report "failed: $BASH_COMMAND"' ERR
           secret() { k get secret t3code-operator-tokens -o jsonpath='{.data.t3code-quickstart}' | base64 --decode; }
           old=$(secret)
           k annotate externalsecret t3code-operator-tokens force-sync="$(date +%s)" --overwrite
