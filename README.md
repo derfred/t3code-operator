@@ -207,8 +207,15 @@ are two ways to get one that the pods accept.
 adds `t3 serve --auth-token-file FILE` (or `T3CODE_AUTH_TOKEN_FILE`): t3
 accepts the token in that file, any string of at least 32 characters, and
 re-reads it when it changes. The image `ghcr.io/derfred/t3code`, used in the
-[Example](#example), has it. Generate a token and give it to both sides, the
-pods and the operator:
+[Example](#example), has it. Or build a minimal one, t3 from the fork and
+git, from [`images/t3`](images/t3/Dockerfile):
+
+```sh
+docker build -t my-registry/t3 images/t3                                # the fork's branch
+docker build -t my-registry/t3 --build-arg T3_REF=<commit> images/t3    # a pinned commit
+```
+
+Generate a token and give it to both sides, the pods and the operator:
 
 ```sh
 openssl rand -hex 32 > token
