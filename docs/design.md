@@ -86,6 +86,29 @@ The operator uses the RPC rather than asking upstream for more HTTP endpoints.
 The RPC is t3's real API, and duplicating it over HTTP would only be more
 surface to keep in sync.
 
+## Auth
+
+Every call carries a bearer token. Each T3EnvironmentSet chooses where it
+comes from (`spec.auth.mode`; [src/auth.ts](../src/auth.ts)):
+
+- **`File`**: the operator and the pods read the same token, from Secrets.
+  This needs t3's `--auth-token-file`, which only the derfred/t3code fork
+  has: upstream t3 accepts only tokens it issued itself.
+- **`Session`**: the operator has each pod issue it a token. It runs `t3 auth
+  session issue` in the t3 container, over pods/exec. Upstream t3 signs those
+  tokens with a key in the pod's own data directory, so the token is per pod,
+  not per set. It is kept in memory only. On a restart the operator issues
+  new ones and revokes what's left under its subject (`t3code-operator`), so
+  nothing needs to be stored and nothing piles up in t3. A token is renewed
+  halfway through its `ttl`, for a new pod UID, and on a 401 (unless it's
+  under a minute old: issuing again won't help then, and every call would
+  exec).
+
+In both modes, a 401 gets the token once more (the file read again, or a new
+session) and the call is retried once. The cost of `Session` is the
+pods/exec right. It covers the whole namespace, so it's a separate Role
+(`deploy/session-auth.yaml`) that only `Session` users apply.
+
 ## Identity
 
 - **IDs:** a project's ID is `k8s-<project>`; a task's is
@@ -225,7 +248,8 @@ follows `deletionPolicy`:
 | The clone fails (bad URL, no access, egress allowlist) | `Error` with git's message; the gate doesn't wait. Retried every 5 minutes from the same repository; a changed `repository` starts over at once, under a fresh project ID. |
 | t3 rejects a field | That environment's entry is `Error` with t3's message. The gate stays open; the next pass retries. |
 | The operator is down | Nothing changes in the environments. **New or restarted pods stay not-Ready, so a rollout stalls** , while the tailnet access stays up. On restart, one pass catches up. |
-| The token is wrong, or t3 is older than `--auth-token-file` | Every environment is `Error: HTTP 401`. |
+| `File`: the token is wrong, or t3 is older than `--auth-token-file` | Every environment of the set is `Error: HTTP 401`. |
+| `Session`: no pods/exec Role, a wrong `container`, or a t3 without `auth session issue` | Every environment of the set is `Error`, with the API server's or t3's message. |
 | t3 changes its RPC protocol | `/ws` answers 426 and every environment goes `Error`. The end-to-end test, run against a new t3 build (`npm run e2e -- --t3-image ...`), catches it before a rollout. |
 
 ## Alternatives considered
@@ -256,6 +280,12 @@ follows `deletionPolicy`:
   (`src/watch.ts`) is about a hundred lines. Worth it once reading everything
   per pass gets expensive.
 - **More HTTP endpoints upstream.** That would duplicate the RPC.
+- **`Session` tokens stored in a Secret** instead of memory. That would save
+  an exec per pod after an operator restart, but the operator would need
+  rights over Secrets, and it would have state to keep consistent.
+- **A sidecar that issues the token and writes it to a Secret.** That avoids
+  pods/exec, but every t3 pod would then need write access to Secrets, and the
+  StatefulSet would have to change.
 
 ## Later work
 

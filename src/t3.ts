@@ -7,6 +7,8 @@
 // {_tag: 'Chunk', requestId, values} frames first; `first` takes the first
 // value of the first chunk and interrupts the stream, so acks never come up.
 
+import type { Credentials } from './auth.ts';
+
 export interface T3Project {
   readonly id: string;
   readonly title: string;
@@ -94,19 +96,30 @@ export function settleFrame(frame: any, pending: Map<string, Pending>): boolean 
   return true;
 }
 
-export function makeT3(origin: string, token: string): T3 {
-  const headers = { authorization: `Bearer ${token}`, 'content-type': 'application/json' };
+// A fixed token (the e2e test's) or credentials that can be refreshed
+// (auth.ts). Only plain HTTP carries the token: the WebSocket is opened with
+// a ticket fetched over it.
+export function makeT3(origin: string, auth: string | Credentials): T3 {
+  const credentials: Credentials = typeof auth === 'string' ? { token: async () => auth, refresh: async () => auth } : auth;
   let socket: Promise<WebSocket> | undefined;
   const pending = new Map<string, Pending>();
   let nextId = 0;
 
   const http = async (method: string, path: string, body?: unknown) => {
-    const response = await fetch(origin + path, {
-      method,
-      headers,
-      body: body === undefined ? undefined : JSON.stringify(body),
-      signal: AbortSignal.timeout(CALL_TIMEOUT_MS),
-    });
+    const send = async (token: string) =>
+      fetch(origin + path, {
+        method,
+        headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
+        body: body === undefined ? undefined : JSON.stringify(body),
+        signal: AbortSignal.timeout(CALL_TIMEOUT_MS),
+      });
+    let response = await send(await credentials.token());
+    // Refused: a rotated file, or a session token t3 no longer knows (its
+    // pod's data directory was replaced). Once more with a fresh token.
+    if (response.status === 401) {
+      await response.body?.cancel();
+      response = await send(await credentials.refresh());
+    }
     const text = await response.text();
     if (!response.ok) throw new T3Error(`${method} ${path}: HTTP ${response.status} ${text.slice(0, 500)}`);
     return text.length === 0 ? undefined : JSON.parse(text);

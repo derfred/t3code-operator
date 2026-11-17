@@ -77,3 +77,40 @@ describe('settleFrame', () => {
     assert.deepEqual(outcome, {});
   });
 });
+
+describe('makeT3 credentials', () => {
+  it('refreshes the token once after a 401, and keeps the fresh one', async () => {
+    const { createServer } = await import('node:http');
+    const { makeT3 } = await import('../src/t3.ts');
+    const seen: string[] = [];
+    const server = createServer((req, res) => {
+      seen.push(String(req.headers.authorization));
+      const ok = req.headers.authorization === 'Bearer fresh';
+      res.writeHead(ok ? 200 : 401, { 'content-type': 'application/json' });
+      res.end(ok ? JSON.stringify({ projects: [] }) : '{"error":"unauthorized"}');
+    });
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+    try {
+      let current = 'stale';
+      let refreshes = 0;
+      const client = makeT3(`http://127.0.0.1:${(server.address() as any).port}`, {
+        token: async () => current,
+        refresh: async () => {
+          refreshes++;
+          return (current = 'fresh');
+        },
+      });
+      assert.deepEqual(await client.listProjects(), []);
+      assert.deepEqual(await client.listProjects(), []);
+      assert.deepEqual(seen, ['Bearer stale', 'Bearer fresh', 'Bearer fresh']);
+      assert.equal(refreshes, 1);
+
+      // Refused again after the refresh: an error, not a loop.
+      current = 'stale';
+      const refused = makeT3(`http://127.0.0.1:${(server.address() as any).port}`, { token: async () => 'bad', refresh: async () => 'worse' });
+      await assert.rejects(refused.listProjects(), /HTTP 401/);
+    } finally {
+      server.close();
+    }
+  });
+});

@@ -12,7 +12,7 @@ import { fileURLToPath } from 'node:url';
 
 const deploy = dirname(fileURLToPath(import.meta.url));
 const check = process.argv.includes('--check');
-const outputs = ['install.yaml'];
+const outputs = ['install.yaml', 'session-auth.yaml'];
 
 // The library's version is the release's: package.json's.
 const pkg = JSON.parse(readFileSync(join(deploy, '..', 'package.json'), 'utf8')).version;

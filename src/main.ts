@@ -8,8 +8,7 @@
 // while a clone is under way, else every RESYNC_INTERVAL_SECONDS.
 // Run with Node's built-in type stripping: `node main.ts`.
 
-import { readFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { fileCredentials, Sessions, type AuthSpec, type Credentials } from './auth.ts';
 import { GROUP, VERSION, makeKube } from './kube.ts';
 import {
   reconcileEnvironmentSet,
@@ -30,8 +29,8 @@ const required = (name: string) => {
 };
 
 const namespace = required('NAMESPACE');
-// One token per StatefulSet: t3 pods of different sets accept different
-// tokens, each in a file named after its StatefulSet.
+// File auth: one token per StatefulSet: t3 pods of different sets accept
+// different tokens, each in a file named after its StatefulSet.
 const tokenDir = required('T3CODE_API_TOKEN_DIR');
 const port = process.env.T3CODE_PORT ?? '3773';
 const resyncMs = Number(process.env.RESYNC_INTERVAL_SECONDS ?? '300') * 1000;
@@ -41,34 +40,32 @@ const log = (level: string, message: string, fields: Record<string, unknown> = {
   console.log(JSON.stringify({ time: new Date().toISOString(), level, message, ...fields }));
 
 const kube = makeKube(namespace);
+// Session auth: the tokens the pods issued, kept from pass to pass.
+const sessions = new Sessions(kube.exec, () => new Date(), (message, fields) => log('info', message, fields));
 
 // Returns whether a clone is under way somewhere, which shortens the next wait.
 async function pass(): Promise<boolean> {
-  // Read per pass: the Secrets are mounted without subPath, so a rotated
-  // token lands here without a restart. A t3 with --auth-token-file watches
-  // its own copy and switches over the same way.
-  const tokens = new Map<string, string>();
-  const tokenFor = (statefulSet: string) => {
-    let token = tokens.get(statefulSet);
-    if (token === undefined) {
-      try {
-        token = readFileSync(join(tokenDir, statefulSet), 'utf8').trim();
-      } catch (error) {
-        throw new Error(`no API token for StatefulSet ${statefulSet} in ${tokenDir}: ${String(error)}`);
-      }
-      tokens.set(statefulSet, token);
-    }
-    return token;
+  // File auth reads per pass: the Secrets are mounted without subPath, so a
+  // rotated token lands here without a restart. A t3 with --auth-token-file
+  // watches its own copy and switches over the same way.
+  const files = new Map<string, Credentials>();
+  // environment (pod) -> the set it belongs to, for its credentials.
+  const setOf = new Map<string, { readonly statefulSet: string; readonly auth: AuthSpec }>();
+  const credentialsFor = (environment: string, uid: string): Credentials => {
+    const set = setOf.get(environment);
+    if (!set) throw new Error(`environment ${environment} belongs to no StatefulSet`);
+    if (set.auth.mode === 'Session') return sessions.credentials({ name: environment, uid }, set.auth);
+    let file = files.get(set.statefulSet);
+    if (!file) files.set(set.statefulSet, (file = fileCredentials(tokenDir, set.statefulSet)));
+    return file;
   };
-  // environment (pod) -> the StatefulSet it belongs to, for its token.
-  const statefulSetOf = new Map<string, string>();
   const clients = new Map<string, T3>();
   try {
     const setResources = await kube.list<EnvironmentSetResource>('t3environmentsets');
     const sets: PlacedSet[] = [];
     for (const set of setResources) {
       const environments = await kube.statefulSetEnvironments(set.spec.statefulSet);
-      for (const env of environments ?? []) statefulSetOf.set(env.name, set.spec.statefulSet);
+      for (const env of environments ?? []) setOf.set(env.name, { statefulSet: set.spec.statefulSet, auth: set.spec.auth ?? {} });
       sets.push({
         name: set.metadata.name,
         labels: set.metadata.labels ?? {},
@@ -76,6 +73,7 @@ async function pass(): Promise<boolean> {
       });
     }
     const world = new World(sets);
+    sessions.retain(new Set(setOf.keys()));
     const deps = {
       kube,
       // On the pod's IP, as of this pass: reconcile only calls ready
@@ -83,11 +81,9 @@ async function pass(): Promise<boolean> {
       t3: (environment: string) => {
         let client = clients.get(environment);
         if (!client) {
-          const ip = world.environment(environment)?.ip;
-          if (!ip) throw new Error(`environment ${environment} has no pod IP`);
-          const statefulSet = statefulSetOf.get(environment);
-          if (!statefulSet) throw new Error(`environment ${environment} belongs to no StatefulSet`);
-          client = makeT3(`http://${ip.includes(':') ? `[${ip}]` : ip}:${port}`, tokenFor(statefulSet));
+          const env = world.environment(environment);
+          if (!env?.ip) throw new Error(`environment ${environment} has no pod IP`);
+          client = makeT3(`http://${env.ip.includes(':') ? `[${env.ip}]` : env.ip}:${port}`, credentialsFor(environment, env.uid));
           clients.set(environment, client);
         }
         return client;
