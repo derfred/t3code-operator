@@ -33,7 +33,7 @@ kubectl apply -f https://raw.githubusercontent.com/derfred/t3code-operator/v0.1.
 
 The manifest [`deploy/install.yaml`](deploy/install.yaml) sets up the
 namespace `t3code`, the two CustomResourceDefinitions, and the operator
-(ServiceAccount, Role, RoleBinding, Deployment). The operator needs a token for each StatefulSet of t3 pods it manages, in Secret `t3code-operator-tokens` (see [Tokens](#tokens)).
+(ServiceAccount, Role, RoleBinding, Deployment). How the operator authenticates to the t3 pods is chosen per set (see [Auth](#auth)): with `File`, the default, it needs a token for each StatefulSet in Secret `t3code-operator-tokens`; with `Session`, it needs `session-auth.yaml` applied as well.
 
 For more customizability use the jsonnet library.  Vendor it at a release tag with jsonnet-bundler (`jb install github.com/derfred/t3code-operator/deploy/jsonnet@v0.1.1`), then:
 
@@ -65,6 +65,8 @@ metadata:
   labels: { tier: team }
 spec:
   statefulSet: t3code-team          # its pods are this set's environments, see below
+  # auth:                           # see Auth
+  #   mode: File                    # File (default) | Session
 ---
 apiVersion: t3code.derfred.com/v1alpha1
 kind: T3Project
@@ -151,20 +153,35 @@ spec:
 stands; each resource's status lists every environment with its phase
 (`Waiting`, `Cloning`, `Ready`, `Error`) and message.
 
-## Auth Tokens
+## Auth
 
-The operator calls t3's API with a bearer token, one per StatefulSet: a file
-named after the StatefulSet, which `install.yaml` mounts from the keys of
-Secret `t3code-operator-tokens`. The token needs t3's standard scopes. There
-are two ways to get one that the pods accept.
+The operator calls t3's API with a bearer token. Each `T3EnvironmentSet`
+chooses where that token comes from, with `spec.auth`:
 
-**1. A token you choose, with a t3 that reads it from a file.** The fork
+```yaml
+spec:
+  statefulSet: t3code-team
+  auth:
+    mode: File          # File (the default) | Session
+    # Session only:
+    container: t3       # the container t3 runs in (default t3)
+    ttl: 7d             # each token's life: s, m, h or d (default 7d)
+```
+
+`kubectl -n t3code get t3environmentsets` shows each set's mode. Switching a
+set from one mode to the other takes effect on the next pass.
+
+### `File`: a token you choose, with a t3 that reads it from a file
+
+The fork
 [derfred/t3code](https://github.com/derfred/t3code/tree/feat/server-auth-token-file)
 adds `t3 serve --auth-token-file FILE` (or `T3CODE_AUTH_TOKEN_FILE`): t3
 accepts the token in that file, any string of at least 32 characters, and
 re-reads it when it changes. The image `ghcr.io/derfred/t3code`, used in the
-[Example](#example), has it. Generate a token and give it to both sides, the
-pods and the operator:
+[Example](#example), has it. The operator reads its copy from a file named
+after the StatefulSet, which `install.yaml` mounts from the keys of Secret
+`t3code-operator-tokens`. Generate a token and give it to both sides, the pods
+and the operator:
 
 ```sh
 openssl rand -hex 32 > token
@@ -185,34 +202,48 @@ into `t3code-operator-tokens`, and the pods mount their key of that same
 Secret, so both sides always read the same token.
 [`examples/quickstart/tokens.yaml`](examples/quickstart/tokens.yaml) rotates
 every 5 minutes. The kubelet updates each pod's mounted copy on its own
-schedule, from seconds to a few minutes, so for a while after each rotation
-the operator's calls may be refused; it simply tries again on its next pass.
-Rotate less often where that matters.
-
-**2. A session token from upstream t3.** Any T3 Code (for example `t3` from
-npm, as in [`e2e/t3.Dockerfile`](e2e/t3.Dockerfile)) issues bearer tokens
-with `t3 auth session issue`. Run it in the pod, once it's up:
-
-```sh
-kubectl -n t3code exec t3code-team-0 -c t3 -- \
-  t3 auth session issue --token-only --label t3code-operator --ttl 365d > token
-kubectl -n t3code create secret generic t3code-operator-tokens --from-file=t3code-team=token
-rm token
-```
-
-Leave out the `T3CODE_AUTH_TOKEN_FILE` variable and the `api-token` volume
-from the StatefulSet. Such a token has limits the first way doesn't:
-
-- It is signed with a key that t3 keeps in its data directory (`~/.t3`), so
-  only the pod that issued it accepts it: one pod per StatefulSet
-  (`replicas: 1`), and a persistent home volume, or a restart invalidates it.
-- It expires: after 30 days by default, or the `--ttl` you give. Issue a new
-  one before then, and replace the Secret:
-  `kubectl -n t3code create secret generic t3code-operator-tokens --from-file=t3code-team=token --dry-run=client -o yaml | kubectl apply -f -`.
+schedule, from seconds to a few minutes. When t3 refuses a token, the operator
+reads the file again and retries once; if the pod hasn't caught up yet, it
+tries again on its next pass. Rotate less often where that matters.
 
 With several StatefulSets, `t3code-operator-tokens` holds one key per
 StatefulSet (`--from-file` once for each). A set whose token is missing shows
 up as an `Error` in its projects' status, and the rest go on.
+
+### `Session`: each pod issues the operator a token
+
+Works with any T3 Code, such as `t3` from npm (as in
+[`e2e/t3.Dockerfile`](e2e/t3.Dockerfile)): no fork and no Secret. The operator
+execs into each pod's t3 container and runs `t3 auth session issue`, which
+needs no running server. It keeps the token in memory:
+
+- **One token per pod.** t3 signs it with a key in the pod's data directory
+  (`~/.t3`), so only that pod accepts it. Any number of replicas works.
+- **Only the scopes it uses:** `orchestration:read`, `orchestration:operate`,
+  `settings:write`, `source-control:write`, `filesystem:read`. Under subject
+  `t3code-operator`, in `t3 auth session list`.
+- **Renewed halfway through its `ttl`**, for a recreated pod, or when t3
+  refuses it (a replaced data directory). The operator then revokes the earlier
+  tokens with subject `t3code-operator`, including those an earlier run of the
+  operator left behind. Switching a set back to `File` leaves its last tokens
+  until they expire, or until `t3 auth session revoke`.
+
+The StatefulSet needs neither `T3CODE_AUTH_TOKEN_FILE` nor the `api-token`
+volume. The operator needs the right to exec into pods, which `install.yaml`
+leaves out. Apply it from the same release as `install.yaml`:
+
+```sh
+kubectl apply -f https://raw.githubusercontent.com/derfred/t3code-operator/vX.Y.Z/deploy/session-auth.yaml
+```
+
+([`deploy/session-auth.yaml`](deploy/session-auth.yaml); with the jsonnet
+library, add `operator.sessionAuth(cfg)`.) Exec can't be granted per pod, so
+this reaches **every pod in the namespace**, the operator's own included.
+That's less than it sounds for the t3 pods, whose API with a `File` token
+already includes running terminals in them. For anything else that runs in
+the namespace, it is new. Keep the t3 pods and the operator in a namespace of
+their own. Without the Role, every environment of a `Session` set is `Error`
+with the API server's `forbidden` message.
 
 ## Configuration
 
@@ -246,11 +277,15 @@ HTTPS, watches, merge and strategic-merge patches, the status subresource,
 finalizers) and a t3 server in Docker. The operator container gets exactly
 what a cluster would give it: `KUBERNETES_SERVICE_HOST`/`PORT`, a
 service-account token and CA at `/var/run/secrets/kubernetes.io/serviceaccount`,
-and the t3 token file; nothing in the operator knows it's a test. The
-scenario creates a set, its StatefulSet and pod, and a project with a task
-through the API, then checks t3 itself: the clone, project fields, overrides,
-the task, the readiness gate, a spec change arriving through the watch within
-seconds, no writes once settled, and archive and cleanup on deletion.
+and the t3 token file; nothing in the operator knows it's a test. The fake
+API server answers exec over WebSocket with `docker exec` in the t3
+container. The scenario creates a set, its StatefulSet and pod, and a project
+with a task through the API, then checks t3 itself: the clone, project fields,
+overrides, the task, the readiness gate, a spec change arriving through the
+watch within seconds, and no writes once settled. It then switches the set to
+`Session` auth and breaks the token file. A spec change still arrives, through
+a token the pod issued, and a recreated pod gets a new token with the old one
+revoked. Last come a failed clone, then archive and cleanup on deletion.
 
 ```sh
 npm run e2e -- --operator-image ghcr.io/derfred/t3code-operator:0.1.1   # a released image
@@ -260,4 +295,5 @@ npm run e2e -- --t3-image ghcr.io/derfred/t3code:2026.11.13              # anoth
 Without Docker, `--operator process --t3-url URL --t3-token TOKEN --remote
 REPO --workspace DIR` runs `src/main.ts` as a process against a t3 you already
 have. The operator reads its service-account token from the standard path, so
-that mode needs one there, as inside a pod.
+that mode needs one there, as inside a pod. Exec runs `t3` on the PATH there:
+set `T3CODE_HOME` to that t3's data directory.

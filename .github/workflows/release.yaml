@@ -109,4 +109,4 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           VERSION: ${{ steps.v.outputs.version }}
         run: |
-          gh release create "v$VERSION" --verify-tag --generate-notes --title "v$VERSION" deploy/install.yaml
+          gh release create "v$VERSION" --verify-tag --generate-notes --title "v$VERSION" deploy/install.yaml deploy/session-auth.yaml

@@ -13,6 +13,10 @@
 // t3 already running locally): the operator runs as `node src/main.ts`. It
 // reads the service-account token from the same fixed path, so that only
 // works where that path exists, such as inside a pod.
+//
+// The operator's exec into the pod (Session auth) runs the command in the t3
+// container with `docker exec`; with --t3-url, here, as `t3` on the PATH
+// (set T3CODE_HOME to the running t3's data directory).
 
 import { execFileSync, spawn, type ChildProcess } from 'node:child_process';
 import { mkdtempSync, readFileSync, rmSync, writeFileSync, chmodSync, mkdirSync } from 'node:fs';
@@ -20,7 +24,7 @@ import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { parseArgs } from 'node:util';
 import { fileURLToPath } from 'node:url';
-import { FakeApiServer } from './fake-apiserver.ts';
+import { FakeApiServer, type ExecHandler } from './fake-apiserver.ts';
 import { NAMESPACE, STATEFUL_SET, run } from './scenario.ts';
 import { makeT3 } from '../src/t3.ts';
 
@@ -56,6 +60,18 @@ function report(title: string, text: string) {
   console.log(`::error title=e2e ${title}::${escaped}`);
 }
 const id = `${process.pid}`;
+
+// Runs a command to its end: its output and exit code, never a throw.
+const runCommand: (argv: string[]) => ReturnType<ExecHandler> = (argv) =>
+  new Promise((resolve) => {
+    const child = spawn(argv[0]!, argv.slice(1), { stdio: ['ignore', 'pipe', 'pipe'] });
+    let stdout = '';
+    let stderr = '';
+    child.stdout.on('data', (d) => (stdout += d));
+    child.stderr.on('data', (d) => (stderr += d));
+    child.on('error', (error) => resolve({ stdout, stderr: String(error), exitCode: 127 }));
+    child.on('close', (code) => resolve({ stdout, stderr, exitCode: code ?? 1 }));
+  });
 
 // A CA, and a certificate for the fake API server signed by it, valid for
 // the names the operator may use for it.
@@ -106,11 +122,13 @@ async function startT3() {
   // Every t3 has this; --auth-token-file only newer ones.
   const token = docker('exec', name, 't3', 'auth', 'session', 'issue', '--token-only', '--label', 'operator-e2e');
   const podIP = docker('inspect', '-f', '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}', name);
-  return { url, token, podIP, t3Port: '3773', remote: '/tmp/origin.git', workspace: '/tmp/workspace' };
+  const exec: ExecHandler = (_pod, _container, command) => runCommand(['docker', 'exec', name, ...command]);
+  return { url, token, podIP, t3Port: '3773', remote: '/tmp/origin.git', workspace: '/tmp/workspace', exec };
 }
 
+const tokenDir = join(work, 'api-token');
+
 function startOperator(apiPort: number, ca: string, t3Token: string, t3Port: string): ChildProcess | undefined {
-  const tokenDir = join(work, 'api-token');
   mkdirSync(tokenDir);
   // One file per StatefulSet, as the projected volume in a cluster has it.
   writeFileSync(join(tokenDir, STATEFUL_SET), t3Token);
@@ -182,13 +200,29 @@ try {
           t3Port: new URL(args['t3-url']).port || '80',
           remote: args.remote ?? '',
           workspace: args.workspace ?? '',
+          exec: ((_pod, _container, command) => runCommand(command)) as ExecHandler,
         }
       : await startT3();
+  api.exec = t3.exec;
   startOperator(apiPort, ca, t3.token, t3.t3Port);
 
   const client = makeT3(t3.url, t3.token);
   try {
-    await run({ api, t3: client, podIP: t3.podIP, remote: t3.remote, workspace: t3.workspace });
+    await run({
+      api,
+      t3: client,
+      podIP: t3.podIP,
+      remote: t3.remote,
+      workspace: t3.workspace,
+      // In the t3 container, as the operator's exec runs it.
+      exec: async (command) => {
+        const out = await t3.exec('t3-e2e-0', 't3', command);
+        if (out.exitCode !== 0) throw new Error(`${command.join(' ')}: exit ${out.exitCode}: ${out.stderr}`);
+        return out.stdout;
+      },
+      // A bind mount in Docker: the operator sees the change.
+      replaceFileToken: (token) => writeFileSync(join(tokenDir, STATEFUL_SET), token),
+    });
   } finally {
     client.close();
   }

@@ -18,11 +18,14 @@ local yaml(objects) =
     'The operator, in one apply: namespace `t3code`, the CustomResourceDefinitions',
     '(cluster-scoped), and the operator itself.',
     '',
-    'It reads the API tokens from Secret `' + cfg.tokenSecret + '` in that namespace, one key',
-    'per StatefulSet of t3 pods, named after it (README.md, Requirements):',
+    'For sets with auth.mode File (the default), it reads the API tokens from',
+    'Secret `' + cfg.tokenSecret + '` in that namespace, one key per StatefulSet of t3',
+    'pods, named after it (README.md, Auth):',
     '',
     '  kubectl -n t3code create secret generic ' + cfg.tokenSecret + ' \\',
     '    --from-file=<statefulSet>=<token file>',
+    '',
+    'For sets with auth.mode Session, also apply session-auth.yaml.',
     '',
     'Another namespace, or a Secret per StatefulSet: vendor deploy/jsonnet and',
     'set `config` there.',
@@ -31,4 +34,11 @@ local yaml(objects) =
     + operator.crds
     + operator.objects(cfg)
   ),
+
+  'session-auth.yaml': header([
+    'For T3EnvironmentSets with auth.mode Session, next to install.yaml: lets the',
+    'operator exec into the pods in namespace `t3code`, where it runs',
+    '`t3 auth session issue` for a token (README.md, Auth). This reaches every',
+    'pod in the namespace.',
+  ]) + yaml(operator.sessionAuth(cfg)),
 }

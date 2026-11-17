@@ -6,6 +6,7 @@
 // environments hold their definitions. See docs/design.md.
 
 import { createHash, randomUUID } from 'node:crypto';
+import type { AuthSpec } from './auth.ts';
 import type { Environment, Kube, Resource } from './kube.ts';
 import { matches, type LabelSelector } from './selector.ts';
 import type { T3, T3Project } from './t3.ts';
@@ -88,7 +89,7 @@ export interface ProjectStatus {
 }
 
 export type ProjectResource = Resource<ProjectSpec, ProjectStatus>;
-export type EnvironmentSetResource = Resource<{ readonly statefulSet: string }, unknown>;
+export type EnvironmentSetResource = Resource<{ readonly statefulSet: string; readonly auth?: AuthSpec }, unknown>;
 
 // What one pass observed: every set with its environments (null when its
 // StatefulSet is missing).

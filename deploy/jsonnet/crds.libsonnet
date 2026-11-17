@@ -97,9 +97,26 @@ local task = {
       required: ['statefulSet'],
       properties: {
         statefulSet: string('The StatefulSet whose pods are this set’s environments.'),
+        auth: {
+          type: 'object',
+          description: 'How the operator authenticates to t3 on these pods. See README.md, Auth.',
+          default: {},
+          properties: {
+            mode: enum(
+              ['File', 'Session'],
+              default='File',
+              description='File: the token in the operator’s token file for this StatefulSet, which the pods accept through `t3 serve --auth-token-file` (the derfred/t3code fork). Session: each pod issues the operator a token with `t3 auth session issue`, run in it through pods/exec (any t3; the operator needs the pods/exec Role).',
+            ),
+            container: string('Session only: the container t3 runs in. Default t3.'),
+            ttl: string('Session only: how long a token lives, such as 7d (s, m, h or d). Renewed halfway. Default 7d.') { pattern: '^[1-9][0-9]*[smhd]$' },
+          },
+        },
       },
     },
-    [{ name: 'StatefulSet', type: 'string', jsonPath: '.spec.statefulSet' }],
+    [
+      { name: 'StatefulSet', type: 'string', jsonPath: '.spec.statefulSet' },
+      { name: 'Auth', type: 'string', jsonPath: '.spec.auth.mode' },
+    ],
   ),
 
   projects: crd(

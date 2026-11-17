@@ -3,11 +3,14 @@
 # The operator, in one apply: namespace `t3code`, the CustomResourceDefinitions
 # (cluster-scoped), and the operator itself.
 #
-# It reads the API tokens from Secret `t3code-operator-tokens` in that namespace, one key
-# per StatefulSet of t3 pods, named after it (README.md, Requirements):
+# For sets with auth.mode File (the default), it reads the API tokens from
+# Secret `t3code-operator-tokens` in that namespace, one key per StatefulSet of t3
+# pods, named after it (README.md, Auth):
 #
 #   kubectl -n t3code create secret generic t3code-operator-tokens \
 #     --from-file=<statefulSet>=<token file>
+#
+# For sets with auth.mode Session, also apply session-auth.yaml.
 #
 # Another namespace, or a Secret per StatefulSet: vendor deploy/jsonnet and
 # set `config` there.
@@ -33,6 +36,9 @@ spec:
     - jsonPath: ".spec.statefulSet"
       name: "StatefulSet"
       type: "string"
+    - jsonPath: ".spec.auth.mode"
+      name: "Auth"
+      type: "string"
     - jsonPath: ".status.phase"
       name: "Phase"
       type: "string"
@@ -45,6 +51,25 @@ spec:
         properties:
           spec:
             properties:
+              auth:
+                default: {}
+                description: "How the operator authenticates to t3 on these pods. See README.md, Auth."
+                properties:
+                  container:
+                    description: "Session only: the container t3 runs in. Default t3."
+                    type: "string"
+                  mode:
+                    default: "File"
+                    description: "File: the token in the operator’s token file for this StatefulSet, which the pods accept through `t3 serve --auth-token-file` (the derfred/t3code fork). Session: each pod issues the operator a token with `t3 auth session issue`, run in it through pods/exec (any t3; the operator needs the pods/exec Role)."
+                    enum:
+                    - "File"
+                    - "Session"
+                    type: "string"
+                  ttl:
+                    description: "Session only: how long a token lives, such as 7d (s, m, h or d). Renewed halfway. Default 7d."
+                    pattern: "^[1-9][0-9]*[smhd]$"
+                    type: "string"
+                type: "object"
               statefulSet:
                 description: "The StatefulSet whose pods are this set’s environments."
                 type: "string"

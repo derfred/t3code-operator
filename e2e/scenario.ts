@@ -6,6 +6,7 @@
 import assert from 'node:assert/strict';
 import type { FakeApiServer } from './fake-apiserver.ts';
 import type { T3 } from '../src/t3.ts';
+import { SESSION_SCOPES, SESSION_SUBJECT } from '../src/auth.ts';
 
 export const NAMESPACE = 't3code';
 // The scenario's StatefulSet; the operator finds its token under this name.
@@ -24,6 +25,10 @@ export interface Context {
   // A repository t3 can clone, and a directory it can clone into.
   readonly remote: string;
   readonly workspace: string;
+  // Runs a command in the t3 container; its stdout.
+  readonly exec: (command: string[]) => Promise<string>;
+  // Replaces the operator's token file for the set (File auth).
+  readonly replaceFileToken: (token: string) => void;
 }
 
 const step = (message: string) => console.log(`e2e: ${message}`);
@@ -46,17 +51,21 @@ async function until<T>(what: string, timeoutMs: number, probe: () => T | undefi
 const overrideOf = async (t3: T3, projectId: string) =>
   ((await t3.call('server.getConfig', {})) as any).settings.projectSettingsOverrides[projectId];
 
-export async function run({ api, t3, podIP, remote, workspace }: Context): Promise<void> {
+const operatorSessions = async (exec: Context['exec']) =>
+  (JSON.parse(await exec(['t3', 'auth', 'session', 'list', '--json'])) as any[]).filter((s) => s.subject === SESSION_SUBJECT);
+
+export async function run({ api, t3, podIP, remote, workspace, exec, replaceFileToken }: Context): Promise<void> {
   // What a StatefulSet with one replica would have made.
   api.create(statefulSets, {
     metadata: { name: STATEFUL_SET },
     spec: { selector: { matchLabels: { app: 't3', set: 'e2e' } } },
   });
-  api.create(pods, {
+  const pod = {
     metadata: { name: 't3-e2e-0', labels: { app: 't3', set: 'e2e' } },
-    spec: { readinessGates: [{ conditionType: GATE }] },
+    spec: { readinessGates: [{ conditionType: GATE }], containers: [{ name: 't3' }] },
     status: { podIP, conditions: [{ type: 'ContainersReady', status: 'True' }] },
-  });
+  };
+  api.create(pods, pod);
   api.create(sets, { metadata: { name: 'e2e', labels: { trust: 'test' } }, spec: { statefulSet: STATEFUL_SET } });
   const gate = () => api.get(pods, 't3-e2e-0')?.status?.conditions?.find((c: any) => c.type === GATE)?.status;
 
@@ -120,6 +129,30 @@ export async function run({ api, t3, podIP, remote, workspace }: Context): Promi
   const started = Date.now();
   await until('the changed override in t3', 10_000, async () => (await overrideOf(t3, 'k8s-e2e'))?.branchNamePrefix === 'changed/');
   step(`a spec change reached t3 in ${Date.now() - started}ms`);
+
+  // Session auth: the pod issues the operator its token (exec, `t3 auth
+  // session issue`). The file is no longer read: a token t3 refuses there
+  // changes nothing.
+  replaceFileToken('refused-'.padEnd(64, 'x'));
+  api.patch(sets, 'e2e', { spec: { auth: { mode: 'Session', container: 't3', ttl: '1h' } } });
+  api.patch(projects, 'e2e', { spec: { settings: { branchNamePrefix: 'session/' } } });
+  await until('the override, applied with a session token', 30_000, async () => (await overrideOf(t3, 'k8s-e2e'))?.branchNamePrefix === 'session/');
+  assert.ok(api.requests.some((r) => r.method === 'EXEC' && r.path.includes('command=issue')), 'the token was issued through exec');
+  const [session, ...more] = await operatorSessions(exec);
+  assert.ok(session && more.length === 0, 'one operator session');
+  assert.deepEqual([...session.scopes].sort(), [...SESSION_SCOPES].sort());
+  step(`Session auth: a spec change reached t3 with a token the pod issued (session ${session.sessionId})`);
+
+  // A recreated pod (new UID) gets a new token, and the old one is revoked.
+  api.delete(pods, 't3-e2e-0');
+  api.create(pods, pod);
+  api.patch(projects, 'e2e', { spec: { settings: { branchNamePrefix: 'recreated/' } } });
+  await until('the override, after the pod was recreated', 30_000, async () => (await overrideOf(t3, 'k8s-e2e'))?.branchNamePrefix === 'recreated/');
+  const renewed = await until('the earlier session to be revoked', 15_000, async () => {
+    const now = await operatorSessions(exec);
+    return now.length === 1 && now[0].sessionId !== session.sessionId ? now[0] : undefined;
+  });
+  step(`a recreated pod issued session ${renewed.sessionId}; the earlier one was revoked`);
 
   // A repository git can't clone: t3 reports the failure (read from its
   // clone stream), and the project turns Error without holding the gate.

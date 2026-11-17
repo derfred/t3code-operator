@@ -48,6 +48,9 @@ export interface Kube {
   // null when the StatefulSet does not exist.
   statefulSetEnvironments(name: string): Promise<ReadonlyArray<Environment> | null>;
   setContentReady(pod: string, ready: boolean, message: string): Promise<void>;
+  // Runs a command in a pod's container (pods/exec); its stdout, or an error
+  // when it can't run or exits non-zero. For Session auth (auth.ts).
+  exec(pod: string, container: string, command: ReadonlyArray<string>): Promise<string>;
 }
 
 export class KubeError extends Error {
@@ -72,6 +75,29 @@ export function toEnvironment(pod: any): Environment {
     ready: !pod.metadata.deletionTimestamp && ip !== null && condition(pod, 'ContainersReady') === 'True',
     contentReady: gate === undefined ? undefined : gate === 'True',
   };
+}
+
+// The exec WebSocket's channels: the first byte of each binary message.
+const STDOUT = 1;
+const STDERR = 2;
+// A metav1.Status as the last message: Success, or why not.
+const STATUS = 3;
+const EXEC_TIMEOUT_MS = 60_000;
+
+// What an exec came to, from the bytes of each channel.
+export function execOutcome(channels: ReadonlyMap<number, ReadonlyArray<Uint8Array>>): { ok: true; stdout: string } | { ok: false; error: string } {
+  const text = (channel: number) => Buffer.concat(channels.get(channel) ?? []).toString('utf8');
+  const statusText = text(STATUS);
+  if (!statusText) return { ok: false, error: 'the connection closed without an exit status' };
+  let status;
+  try {
+    status = JSON.parse(statusText);
+  } catch {
+    return { ok: false, error: `unreadable exit status: ${statusText.slice(0, 200)}` };
+  }
+  if (status.status === 'Success') return { ok: true, stdout: text(STDOUT) };
+  const stderr = text(STDERR).trim();
+  return { ok: false, error: [status.message ?? status.reason ?? 'failed', stderr.slice(-500)].filter(Boolean).join(': ') };
 }
 
 export function makeKube(namespace: string): Kube {
@@ -126,6 +152,51 @@ export function makeKube(namespace: string): Kube {
       return pods.items
         .map(toEnvironment)
         .sort((a: Environment, b: Environment) => a.name.localeCompare(b.name, 'en', { numeric: true }));
+    },
+    exec: async (pod, container, command) => {
+      const query = new URLSearchParams({ container, stdout: 'true', stderr: 'true' });
+      for (const arg of command) query.append('command', arg);
+      const path = `/api/v1/namespaces/${namespace}/pods/${encodeURIComponent(pod)}/exec?${query}`;
+      const failed = (detail: string) => new KubeError(`exec in ${pod}/${container} (${command.slice(0, 4).join(' ')}): ${detail}`, 0);
+      // v5 and v4 both end with a Status on channel 3; v5 only adds a way to
+      // close stdin, which this never opens. Node's WebSocket (undici) takes
+      // headers, and the API server's CA from NODE_EXTRA_CA_CERTS, as fetch does.
+      const ws = new WebSocket(base.replace(/^http/, 'ws') + path, {
+        protocols: ['v5.channel.k8s.io', 'v4.channel.k8s.io'],
+        headers: { authorization: authorization() },
+      } as any);
+      ws.binaryType = 'arraybuffer';
+      const channels = new Map<number, Uint8Array[]>();
+      let errored = false;
+      return new Promise<string>((resolve, reject) => {
+        const timer = setTimeout(() => {
+          ws.close();
+          reject(failed(`no exit within ${EXEC_TIMEOUT_MS / 1000}s`));
+        }, EXEC_TIMEOUT_MS);
+        ws.addEventListener('message', (event) => {
+          const bytes = new Uint8Array(event.data as ArrayBuffer);
+          if (bytes.length === 0) return;
+          channels.set(bytes[0]!, [...(channels.get(bytes[0]!) ?? []), bytes.subarray(1)]);
+        });
+        ws.addEventListener('close', () => {
+          // After an error, which reports it.
+          if (errored) return;
+          clearTimeout(timer);
+          const outcome = execOutcome(channels);
+          if (outcome.ok) resolve(outcome.stdout);
+          else reject(failed(outcome.error));
+        });
+        ws.addEventListener('error', () => {
+          // A refused upgrade (no RBAC, no such pod) reaches the WebSocket
+          // with no reason. The same request as a POST gets it in words.
+          errored = true;
+          clearTimeout(timer);
+          request('POST', path).then(
+            () => reject(failed('the WebSocket failed')),
+            (error) => reject(failed(error instanceof KubeError && error.status === 400 ? 'the WebSocket failed' : String(error.message ?? error))),
+          );
+        });
+      });
     },
     setContentReady: async (pod, ready, message) => {
       // Strategic merge: conditions merge by type. A JSON merge patch would

@@ -8,7 +8,7 @@
 //
 // `crds` are cluster-scoped: apply them before anything that uses their
 // kinds. `objects(cfg)` are namespaced, all in cfg.namespace, and hold no
-// Secret: the API tokens are the caller's (see README.md, Requirements).
+// Secret: the API tokens are the caller's (see README.md, Auth).
 local crds = import 'crds.libsonnet';
 local version = (import 'version.json').version;
 
@@ -57,7 +57,7 @@ local version = (import 'version.json').version;
 
   // What the operator does in its namespace: its own kinds, the
   // StatefulSets they name, their pods, and the pods' content-ready
-  // condition. No Secrets.
+  // condition. No Secrets, and no exec: that is sessionAuth's.
   rules: [
     {
       apiGroups: ['t3code.derfred.com'],
@@ -73,6 +73,36 @@ local version = (import 'version.json').version;
     { apiGroups: [''], resources: ['pods'], verbs: ['get', 'list', 'watch'] },
     { apiGroups: [''], resources: ['pods/status'], verbs: ['patch'] },
   ],
+
+  // Session auth (README.md, Auth): a Role and RoleBinding that let the
+  // operator exec into pods, to have t3 issue it a token there. Only for
+  // sets with auth.mode Session: exec reaches every pod in the namespace.
+  //   operator.crds + operator.objects(cfg) + operator.sessionAuth(cfg)
+  // create for the WebSocket exec of Kubernetes 1.31 and later, get before.
+  sessionRules: [
+    { apiGroups: [''], resources: ['pods/exec'], verbs: ['create', 'get'] },
+  ],
+
+  sessionAuth(cfg):: (
+    assert cfg.namespace != null : 't3code-operator: config.namespace is required';
+    local name = cfg.name + '-exec';
+    local metadata = { name: name, namespace: cfg.namespace, labels: cfg.labels };
+    [
+      {
+        apiVersion: 'rbac.authorization.k8s.io/v1',
+        kind: 'Role',
+        metadata: metadata,
+        rules: $.sessionRules,
+      },
+      {
+        apiVersion: 'rbac.authorization.k8s.io/v1',
+        kind: 'RoleBinding',
+        metadata: metadata,
+        roleRef: { apiGroup: 'rbac.authorization.k8s.io', kind: 'Role', name: name },
+        subjects: [{ kind: 'ServiceAccount', name: cfg.name, namespace: cfg.namespace }],
+      },
+    ]
+  ),
 
   objects(cfg):: (
     assert cfg.namespace != null : 't3code-operator: config.namespace is required';

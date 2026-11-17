@@ -17,8 +17,12 @@
 // - DELETE: an object with finalizers gets a deletionTimestamp and stays
 //   until a patch empties them, as on a real cluster.
 // - generation counts spec changes; resourceVersion is one counter for all.
+// - pods/{name}/exec: a WebSocket upgrade, answered in v4/v5.channel.k8s.io
+//   (stdout on channel 1, stderr on 2, a metav1.Status on 3, then close),
+//   by running the command with the `exec` the test gives.
 
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
+import type { Duplex } from 'node:stream';
 import { createServer, type Server } from 'node:https';
 import type { IncomingMessage, ServerResponse } from 'node:http';
 
@@ -32,6 +36,31 @@ interface Event {
 
 const PATH =
   /^\/(?:api\/(?<coreVersion>v1)|apis\/(?<group>[^/]+)\/(?<version>[^/]+))\/namespaces\/(?<ns>[^/]+)\/(?<plural>[^/]+)(?:\/(?<name>[^/]+))?(?:\/(?<sub>status))?$/;
+
+const EXEC_PATH = /^\/api\/v1\/namespaces\/(?<ns>[^/]+)\/pods\/(?<pod>[^/]+)\/exec$/;
+
+// How the test runs a command in a pod.
+export type ExecHandler = (
+  pod: string,
+  container: string,
+  command: string[],
+) => Promise<{ readonly stdout: string; readonly stderr: string; readonly exitCode: number }>;
+
+// One unmasked server frame: binary (0x2) or close (0x8).
+function wsFrame(opcode: number, payload: Buffer): Buffer {
+  const n = payload.length;
+  const head = n < 126 ? Buffer.from([0x80 | opcode, n]) : n < 65536 ? Buffer.alloc(4) : Buffer.alloc(10);
+  if (n >= 126 && n < 65536) {
+    head[0] = 0x80 | opcode;
+    head[1] = 126;
+    head.writeUInt16BE(n, 2);
+  } else if (n >= 65536) {
+    head[0] = 0x80 | opcode;
+    head[1] = 127;
+    head.writeBigUInt64BE(BigInt(n), 2);
+  }
+  return Buffer.concat([head, payload]);
+}
 
 const clone = <T>(v: T): T => structuredClone(v);
 
@@ -77,6 +106,8 @@ export class FakeApiServer {
   #rv = 1;
   #server: Server | undefined;
   readonly requests: Array<{ method: string; path: string }> = [];
+  // Set by the test before the operator first execs.
+  exec: ExecHandler | undefined;
 
   // collection: '/api/v1/namespaces/t3code/pods' and the like.
   #collection(collection: string) {
@@ -153,6 +184,9 @@ export class FakeApiServer {
     this.#server = createServer({ key: options.key, cert: options.cert }, (req, res) => {
       this.#handle(req, res).catch((error) => this.#send(res, 500, { message: String(error) }));
     });
+    this.#server.on('upgrade', (req, socket) => {
+      this.#upgrade(req, socket).catch(() => socket.destroy());
+    });
     return new Promise((resolve) =>
       this.#server!.listen(options.port ?? 0, options.host ?? '0.0.0.0', () => resolve((this.#server!.address() as any).port)),
     );
@@ -228,6 +262,56 @@ export class FakeApiServer {
       return this.#send(res, 200, this.#store(collection, next, current));
     }
     return this.#send(res, 405, { message: 'method not allowed' });
+  }
+
+  async #upgrade(req: IncomingMessage, socket: Duplex) {
+    const url = new URL(req.url!, 'https://fake');
+    this.requests.push({ method: 'EXEC', path: url.pathname + url.search });
+    const refuse = (status: string) => socket.end(`HTTP/1.1 ${status}\r\nconnection: close\r\n\r\n`);
+    if (!/^Bearer \S+/.test(req.headers.authorization ?? '')) return refuse('401 Unauthorized');
+    const m = EXEC_PATH.exec(url.pathname);
+    const key = req.headers['sec-websocket-key'];
+    if (!m || typeof key !== 'string') return refuse('404 Not Found');
+    const offered = String(req.headers['sec-websocket-protocol'] ?? '').split(',').map((p) => p.trim());
+    const protocol = offered.find((p) => p === 'v5.channel.k8s.io' || p === 'v4.channel.k8s.io');
+    if (!protocol) return refuse('400 Bad Request');
+    const pod = this.get(`/api/v1/namespaces/${m.groups!.ns}/pods`, m.groups!.pod!);
+    if (!pod) return refuse('404 Not Found');
+    if (!this.exec) return refuse('501 Not Implemented');
+
+    const accept = createHash('sha1').update(key + '258EAFA5-E914-47DA-95CA-C5AB0DC85B11').digest('base64');
+    socket.write(
+      `HTTP/1.1 101 Switching Protocols\r\nupgrade: websocket\r\nconnection: Upgrade\r\n` +
+        `sec-websocket-accept: ${accept}\r\nsec-websocket-protocol: ${protocol}\r\n\r\n`,
+    );
+    // Nothing comes from the client but a close, which needs no answer here.
+    socket.on('data', () => undefined);
+    socket.on('error', () => undefined);
+    const channel = (n: number, text: string) => socket.write(wsFrame(0x2, Buffer.concat([Buffer.from([n]), Buffer.from(text)])));
+
+    const container = url.searchParams.get('container') ?? pod.spec?.containers?.[0]?.name ?? '';
+    let status: Obj;
+    try {
+      const out = await this.exec(m.groups!.pod!, container, url.searchParams.getAll('command'));
+      if (out.stdout) channel(1, out.stdout);
+      if (out.stderr) channel(2, out.stderr);
+      status =
+        out.exitCode === 0
+          ? { metadata: {}, status: 'Success' }
+          : {
+              metadata: {},
+              status: 'Failure',
+              reason: 'NonZeroExitCode',
+              message: `command terminated with non-zero exit code: exit code ${out.exitCode}`,
+              details: { causes: [{ reason: 'ExitCode', message: String(out.exitCode) }] },
+            };
+    } catch (error) {
+      status = { metadata: {}, status: 'Failure', reason: 'InternalError', message: String(error) };
+    }
+    channel(3, JSON.stringify(status));
+    const code = Buffer.alloc(2);
+    code.writeUInt16BE(1000);
+    socket.end(wsFrame(0x8, code));
   }
 
   #watch(req: IncomingMessage, res: ServerResponse, url: URL, collection: string, selector: string | null) {
