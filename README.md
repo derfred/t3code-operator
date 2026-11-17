@@ -28,14 +28,14 @@ with a link to open t3 on localhost; `--delete` removes it all. `examples/t3-ima
 ## Install
 
 ```sh
-kubectl apply -f https://raw.githubusercontent.com/derfred/t3code-operator/v0.1.1/deploy/install.yaml
+kubectl apply -f https://raw.githubusercontent.com/derfred/t3code-operator/v0.2.0/deploy/install.yaml
 ```
 
 The manifest [`deploy/install.yaml`](deploy/install.yaml) sets up the
 namespace `t3code`, the two CustomResourceDefinitions, and the operator
 (ServiceAccount, Role, RoleBinding, Deployment). How the operator authenticates to the t3 pods is chosen per set (see [Auth](#auth)): with `File`, the default, it needs a token for each StatefulSet in Secret `t3code-operator-tokens`; with `Session`, it needs `session-auth.yaml` applied as well.
 
-For more customizability use the jsonnet library.  Vendor it at a release tag with jsonnet-bundler (`jb install github.com/derfred/t3code-operator/deploy/jsonnet@v0.1.1`), then:
+For more customizability use the jsonnet library.  Vendor it at a release tag with jsonnet-bundler (`jb install github.com/derfred/t3code-operator/deploy/jsonnet@v0.2.0`), then:
 
 ```jsonnet
 local operator = import 't3code-operator/main.libsonnet';
@@ -233,7 +233,7 @@ volume. The operator needs the right to exec into pods, which `install.yaml`
 leaves out. Apply it from the same release as `install.yaml`:
 
 ```sh
-kubectl apply -f https://raw.githubusercontent.com/derfred/t3code-operator/vX.Y.Z/deploy/session-auth.yaml
+kubectl apply -f https://raw.githubusercontent.com/derfred/t3code-operator/v0.2.0/deploy/session-auth.yaml
 ```
 
 ([`deploy/session-auth.yaml`](deploy/session-auth.yaml); with the jsonnet
@@ -288,7 +288,7 @@ a token the pod issued, and a recreated pod gets a new token with the old one
 revoked. Last come a failed clone, then archive and cleanup on deletion.
 
 ```sh
-npm run e2e -- --operator-image ghcr.io/derfred/t3code-operator:0.1.1   # a released image
+npm run e2e -- --operator-image ghcr.io/derfred/t3code-operator:0.2.0   # a released image
 npm run e2e -- --t3-image ghcr.io/derfred/t3code:2026.11.13              # another t3 build
 ```
 
