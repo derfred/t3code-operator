@@ -155,15 +155,30 @@ spec:
                     type: "object"
                 type: "object"
               path:
-                description: "Checkout path in the pod. Default /workspace/<name>."
+                description: "The project folder in the pod. Default /workspace/<name>."
                 pattern: "^/"
                 type: "string"
               project:
                 description: "Fields of t3 project.update: defaultModelSelection, defaultThreadEnvMode, autoPull, scripts, projectIcon, pinned, archived."
                 type: "object"
                 x-kubernetes-preserve-unknown-fields: true
+              repositories:
+                additionalProperties:
+                  properties:
+                    path:
+                      description: "Where to clone it. Relative: inside the project folder, at most two levels down (t3 looks no deeper). Absolute, outside the project folder: tracked in the project as a folder of its own. Default: the repository's name."
+                      type: "string"
+                    url:
+                      description: "Clone URL."
+                      type: "string"
+                  required:
+                  - "url"
+                  type: "object"
+                description: "A project of several repositories, by name, instead of repository: the project folder is a plain folder, and t3 finds the repositories in it on its own. Each is cloned once and then left as it is: a changed url isn't cloned again, and a removed one stays on disk."
+                minProperties: 1
+                type: "object"
               repository:
-                description: "Clone URL."
+                description: "Clone URL. The project folder is its checkout. Or repositories, for a project of several."
                 type: "string"
               settings:
                 description: "The project's whole set of t3 setting overrides (projectSettingsOverrides). Absent: left alone, or cleared if the operator set it before."
@@ -244,7 +259,7 @@ spec:
                       description: "Default \"<project>: <task>\"."
                       type: "string"
                     workspaceStrategy:
-                      description: "Default {type: root}. Or {type: worktree, baseRef, branch?, startFromOrigin?}."
+                      description: "Default {type: root}. Or {type: worktree, baseRef, branch?, startFromOrigin?, repositories?: [{path}]}."
                       type: "object"
                       x-kubernetes-preserve-unknown-fields: true
                   required:
@@ -258,9 +273,10 @@ spec:
               title:
                 description: "Project title in t3. Default <name>."
                 type: "string"
-            required:
-            - "repository"
             type: "object"
+            x-kubernetes-validations:
+            - message: "give exactly one of repository and repositories"
+              rule: "has(self.repository) != has(self.repositories)"
           status:
             type: "object"
             x-kubernetes-preserve-unknown-fields: true

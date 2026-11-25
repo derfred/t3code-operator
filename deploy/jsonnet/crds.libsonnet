@@ -80,7 +80,7 @@ local task = {
     runtimeMode: enum(['approval-required', 'auto-accept-edits', 'auto', 'full-access']),
     interactionMode: enum(['default', 'plan'], default='default'),
     threadMode: enum(['new_thread', 'continue', 'fresh_session']),
-    workspaceStrategy: opaque('Default {type: root}. Or {type: worktree, baseRef, branch?, startFromOrigin?}.'),
+    workspaceStrategy: opaque('Default {type: root}. Or {type: worktree, baseRef, branch?, startFromOrigin?, repositories?: [{path}]}.'),
     placement: enum(
       ['One', 'EachEnvironment'],
       default='One',
@@ -122,10 +122,26 @@ local task = {
   projects: crd(
     'T3Project',
     {
-      required: ['repository'],
+      'x-kubernetes-validations': [{
+        rule: 'has(self.repository) != has(self.repositories)',
+        message: 'give exactly one of repository and repositories',
+      }],
       properties: {
-        repository: string('Clone URL.'),
-        path: string('Checkout path in the pod. Default /workspace/<name>.') { pattern: '^/' },
+        repository: string('Clone URL. The project folder is its checkout. Or repositories, for a project of several.'),
+        repositories: {
+          type: 'object',
+          description: "A project of several repositories, by name, instead of repository: the project folder is a plain folder, and t3 finds the repositories in it on its own. Each is cloned once and then left as it is: a changed url isn't cloned again, and a removed one stays on disk.",
+          minProperties: 1,
+          additionalProperties: {
+            type: 'object',
+            required: ['url'],
+            properties: {
+              url: string('Clone URL.'),
+              path: string("Where to clone it. Relative: inside the project folder, at most two levels down (t3 looks no deeper). Absolute, outside the project folder: tracked in the project as a folder of its own. Default: the repository's name."),
+            },
+          },
+        },
+        path: string('The project folder in the pod. Default /workspace/<name>.') { pattern: '^/' },
         title: string('Project title in t3. Default <name>.'),
         environmentSetSelector: labelSelector('T3EnvironmentSets to place the project on, on every one of their environments. Default {}: all of them.') { default: {} },
         project: opaque('Fields of t3 project.update: defaultModelSelection, defaultThreadEnvMode, autoPull, scripts, projectIcon, pinned, archived.'),

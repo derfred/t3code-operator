@@ -153,6 +153,51 @@ spec:
 stands; each resource's status lists every environment with its phase
 (`Waiting`, `Cloning`, `Ready`, `Error`) and message.
 
+### Several repositories in one project
+
+Since t3 0.1.12, a project can cover several repositories: t3 finds every
+repository inside the project folder on its own (one level down, or two
+through a plain folder such as `apps/`), and a thread can work in all of
+them. Give `repositories` instead of `repository`, and the project folder is
+a plain folder with each repository cloned into it:
+
+```yaml
+apiVersion: t3code.derfred.com/v1alpha1
+kind: T3Project
+metadata:
+  name: shop
+  namespace: t3code
+spec:
+  repositories:                     # instead of repository; by name
+    api:
+      url: https://github.com/example/shop-api.git     # cloned to /workspace/shop/api
+    web:
+      url: https://github.com/example/shop-web.git
+      path: apps/web                # relative: inside the project folder, at most two levels down
+    design-system:
+      url: https://github.com/example/design-system.git
+      path: /workspace/design-system  # absolute, outside it: tracked in the project
+```
+
+- **Cloning:** each repository is cloned once, by t3 (`sourceControl.cloneRepository`,
+  with t3's own credentials, as for `repository`). The environment is
+  `Cloning`, and holds its readiness gate, until all of them are there. Files
+  already in a repository's folder are kept as they are.
+- **Status:** each environment's entry lists its `repositories`, each with a
+  `phase` and `message`. A failed clone is an `Error`, retried every 5
+  minutes, or at once after its `url` changes.
+- **Folders outside the project folder** are added to the project as tracked
+  folders (Settings → Projects → Repositories in t3). The operator adds and
+  removes only its own, so folders added in t3 stay.
+- **Changing or removing a repository** leaves its files alone: a changed
+  `url` isn't cloned again, and a removed repository stays on disk (and in the
+  project, if it is inside the project folder: delete it, or list it under
+  `ignoreRepositories` in the project's `t3.json`). A removed one outside the
+  project folder is untracked.
+- **Worktree threads** get a worktree of every repository (of none, above
+  eight, until you choose); a task names the ones it wants in
+  `workspaceStrategy`: `{type: worktree, baseRef: main, repositories: [{path: /workspace/shop/api}]}`.
+
 ## Auth
 
 The operator calls t3's API with a bearer token. Each `T3EnvironmentSet`

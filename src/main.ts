@@ -9,6 +9,7 @@
 // Run with Node's built-in type stripping: `node main.ts`.
 
 import { fileCredentials, Sessions, type AuthSpec, type Credentials } from './auth.ts';
+import { Clones } from './clones.ts';
 import { GROUP, VERSION, makeKube } from './kube.ts';
 import {
   reconcileEnvironmentSet,
@@ -42,6 +43,10 @@ const log = (level: string, message: string, fields: Record<string, unknown> = {
 const kube = makeKube(namespace);
 // Session auth: the tokens the pods issued, kept from pass to pass.
 const sessions = new Sessions(kube.exec, () => new Date(), (message, fields) => log('info', message, fields));
+// The clones of multi-repository projects, which outlive a pass. One that
+// ends runs a pass, which records it.
+const trigger = new Trigger();
+const clones = new Clones({ onEnd: () => trigger.notify() });
 
 // Returns whether a clone is under way somewhere, which shortens the next wait.
 async function pass(): Promise<boolean> {
@@ -74,20 +79,26 @@ async function pass(): Promise<boolean> {
     }
     const world = new World(sets);
     sessions.retain(new Set(setOf.keys()));
+    // On the pod's IP, as of this pass: reconcile only calls ready
+    // environments, and a ready pod has an IP.
+    const connect = (environment: string) => {
+      const env = world.environment(environment);
+      if (!env?.ip) throw new Error(`environment ${environment} has no pod IP`);
+      return makeT3(`http://${env.ip.includes(':') ? `[${env.ip}]` : env.ip}:${port}`, credentialsFor(environment, env.uid));
+    };
     const deps = {
       kube,
-      // On the pod's IP, as of this pass: reconcile only calls ready
-      // environments, and a ready pod has an IP.
       t3: (environment: string) => {
         let client = clients.get(environment);
         if (!client) {
-          const env = world.environment(environment);
-          if (!env?.ip) throw new Error(`environment ${environment} has no pod IP`);
-          client = makeT3(`http://${env.ip.includes(':') ? `[${env.ip}]` : env.ip}:${port}`, credentialsFor(environment, env.uid));
+          client = connect(environment);
           clients.set(environment, client);
         }
         return client;
       },
+      // Not closed with the pass: Clones closes it when its clone ends.
+      connect,
+      clones,
       now: () => new Date(),
     };
 
@@ -123,7 +134,6 @@ async function pass(): Promise<boolean> {
 const stop = new AbortController();
 for (const signal of ['SIGTERM', 'SIGINT'] as const) process.on(signal, () => stop.abort());
 
-const trigger = new Trigger();
 const custom = `/apis/${GROUP}/${VERSION}/namespaces/${namespace}`;
 const watched = [
   `${custom}/t3projects`,
