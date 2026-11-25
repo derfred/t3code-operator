@@ -22,11 +22,16 @@ on them.
 - **Project**: a repository, its t3 settings and its tasks. A `T3Project`.
 - **Task**: a t3 scheduled task. **t3 runs it** on its own schedule. The
   operator only decides which environments hold its definition.
+- **Workflow**: a t3 workflow file, TypeScript in the T3 home's workflows
+  folder, which t3 loads and runs (schedules, webhooks, agents, questions to a
+  person). A `T3Workflow`. As with tasks, t3 runs it, and the operator only
+  decides which environments hold the file.
 
 ## Scope
 
 v1 manages projects (clone, register, settings, overrides, removal), their
-scheduled tasks, and each environment's readiness. Out of scope for v1:
+scheduled tasks, workflow files, and each environment's readiness. Out of
+scope for v1:
 
 - **Deleting checkouts from disk.** t3 has no API for it. Removal unregisters
   or archives the project, and the files stay.
@@ -35,6 +40,9 @@ scheduled tasks, and each environment's readiness. Out of scope for v1:
 - **Webhook signature secrets on tasks.** They would sit in plain text in a
   resource. Webhook schedules without a signature work.
 - **Threads**, and anything else a user does inside a project.
+- **Workflow runs**: starting, answering, resuming or cancelling them. That
+  stays with t3's app and `t3 workflow`, and with the workflows' own
+  triggers. So do webhook URLs, whose path holds the hook's secret.
 
 ## Who owns what
 
@@ -73,6 +81,11 @@ mutations for `t3 project add`.
 | Check whether a checkout has files | RPC | `projects.listEntries` | `filesystem:read` |
 | Project setting overrides | RPC | `server.updateSettings` (`projectSettingsOverrides`) | `settings:write` |
 | Scheduled tasks | RPC | `scheduledTasks.upsert` / `.delete` | `orchestration:operate` |
+| Whether workflows are on | RPC | `server.getConfig` (`settings.workflowsEnabled`) | `orchestration:read` |
+| Turn workflows on or off | RPC | `server.updateSettings` (`workflowsEnabled`) | `settings:write` |
+| Workflow files, as loaded | RPC | `workflows.getDefinition` | `filesystem:read` |
+| Save or delete a workflow file | RPC | `workflows.saveDefinition` / `.deleteDefinition` | `terminal:operate` |
+| Workflow runs and open questions | RPC | `workflows.subscribe` (first value) | `orchestration:read` |
 | WebSocket ticket | HTTP | `POST /api/auth/websocket-ticket/rpc` | any session |
 
 Two properties make a declarative layer simple:
@@ -131,7 +144,8 @@ The operator is level-triggered: each pass reads everything and reconciles
 everything, so a pass never depends on which event caused it. Passes run:
 
 - **On a change**, within about a second. Watches on T3Projects,
-  T3EnvironmentSets and the t3 pods wake the loop
+  T3Workflows, T3EnvironmentSets, ConfigMaps (a T3Workflow's `sourceFrom`)
+  and the t3 pods wake the loop
   ([watch.ts](../src/watch.ts)): a spec edit, a
   new or restarted pod, a scale up or down. Several changes at once make one
   pass. The watches list once, then stream from that resourceVersion, resume
@@ -217,7 +231,9 @@ Each pass:
    change-or-resync rule as projects. Holders that are no longer chosen get
    `scheduledTasks.delete`. A task with nowhere to go says so in
    `status.tasks`.
-4. **Readiness.** For each environment, `content-ready` is true when no
+4. **Workflows**, after projects, since a workflow can wait for its
+   projects. See [Workflows](#workflows).
+5. **Readiness.** For each environment, `content-ready` is true when no
    project placed there is still on its way: `Waiting`, or `Cloning` for up to
    15 minutes. An `Error` does not hold the gate: it's in status for a person
    to fix, and holding the gate on it would stall every later rollout. A
@@ -229,10 +245,15 @@ Each pass:
   `Deleting`), `environments[]` (each with `phase`, `message`, `projectId`,
   and the tasks it holds), and `tasks[]` (where each task is placed, or why
   it isn't).
-- **T3EnvironmentSet:** each environment's readiness and projects.
+- **T3Workflow:** `phase` (`Ready`, `Progressing`, `Degraded`, `Error`,
+  `Waiting`, `Deleting`), a `Ready` condition, the source's hash, and
+  `environments[]` (each with `phase`, `message`, the `name@version`s t3
+  loaded, t3's `problems`, and its unfinished runs).
+- **T3EnvironmentSet:** each environment's readiness and projects, and
+  `managesWorkflows` where the operator turned t3's workflows on.
 
-`kubectl -n t3code get t3projects,t3environmentsets` shows both. Status is
-written only when it changes.
+`kubectl -n t3code get t3projects,t3workflows,t3environmentsets` shows them.
+Status is written only when it changes.
 
 **Ownership of settings:** `settings` replaces the project's entire override
 set, so with it present the resource is the source of truth and edits in the
@@ -257,6 +278,55 @@ follows `deletionPolicy`:
 - **A pod that will never come back:** remove the finalizer by hand to let the
   resource go.
 
+## Workflows
+
+A T3Workflow is one file, `k8s-<name>.ts`, in the workflows folder of the T3
+home. t3 watches that folder, so the operator only writes the file, through
+t3 (`workflows.saveDefinition`), which checks it first.
+
+- **Source.** `spec.source` holds the file, or `spec.sourceFrom.configMapKeyRef`
+  names a key of a ConfigMap in the namespace, which suits a file kept in git
+  next to the manifests (kustomize's `configMapGenerator`). ConfigMaps are
+  watched, so a changed ConfigMap is applied without the T3Workflow changing.
+  A source that can't be read (no such ConfigMap or key) turns the T3Workflow
+  `Error` and **leaves the file where it is**: a missing source is no reason
+  to stop a running workflow.
+- **Placement**, as for tasks: the candidates are the environments of the sets
+  `environmentSetSelector` matches; the eligible ones are ready and have every
+  T3Project in `spec.projects` Ready (an agent step pointed at a folder t3 has
+  no project for pauses). `One` (the default) keeps the file on one
+  environment across pod restarts: the workflow's runs, schedules and webhook
+  URLs live in that environment's database, so moving it would orphan them.
+  `EachEnvironment` puts it on every one, and its triggers fire on each.
+- **Applying.** The operator reads the definitions (`workflows.getDefinition`)
+  every pass and saves the file where it is missing or differs: the file's
+  contents are the state, so an edit or deletion in the t3 app is undone on
+  the next pass, and nothing needs a resync timer. t3 refuses a file that
+  doesn't load, or one that drops a version while runs of it are open, and
+  then **keeps the file it had**: the environment is `Degraded` with t3's
+  reason, and the save is tried again every pass. Removing a version
+  therefore works by keeping it in the file until its runs have ended, then
+  dropping it.
+- **Workflows on and off.** t3 neither lists nor saves workflow files while
+  `workflowsEnabled` is off, so the operator turns it on in an environment
+  before anything else there, and records that it did in the
+  T3EnvironmentSet's status (`managesWorkflows`). Once it holds no workflow
+  in an environment, it turns them off again there, but only where it turned
+  them on, and only if no file is left: a file someone else put there, or one
+  a `Retain` left behind, keeps them on, and they are then no longer the
+  operator's to turn off.
+- **Status.** Each environment reports what t3 loaded (`name@version`), t3's
+  `problems`, the runs of those workflows that have not ended
+  (`activeRuns`), and of those, the ones waiting on a person (`needsYou`:
+  open questions and paused runs). A `Ready` condition with
+  `observedGeneration` lets `kubectl wait` and Flux's health checks (kstatus)
+  see a file t3 refused.
+- **Removal.** Leaving an environment, or the T3Workflow being deleted under
+  `deletionPolicy: Delete` (the default), deletes the file
+  (`workflows.deleteDefinition`). t3 refuses that while runs of it are open,
+  so the environment stays `Removing`, and a deleted T3Workflow keeps its
+  finalizer, until they end or someone cancels them. `Retain` leaves the file.
+
 ## Failure modes
 
 | Situation | What happens |
@@ -267,6 +337,9 @@ follows `deletionPolicy`:
 | The operator is down | Nothing changes in the environments. **New or restarted pods stay not-Ready, so a rollout stalls** , while the tailnet access stays up. On restart, one pass catches up. |
 | `File`: the token is wrong, or t3 is older than `--auth-token-file` | Every environment of the set is `Error: HTTP 401`. |
 | `Session`: no pods/exec Role, a wrong `container`, or a t3 without `auth session issue` | Every environment of the set is `Error`, with the API server's or t3's message. |
+| A workflow file t3 won't load, or that drops a version with runs open | That environment is `Degraded` with t3's reason; t3 keeps running the file it had. Saved again every pass, so it goes through once the runs end. |
+| A T3Workflow's ConfigMap or key is missing | `Error`; the file stays as it is on every environment. |
+| A deleted T3Workflow whose runs are open | `Deleting`, with the finalizer kept, until they end or are cancelled (`t3 workflow cancel`, or the app). |
 | t3 changes its RPC protocol | `/ws` answers 426 and every environment goes `Error`. The end-to-end test, run against a new t3 build (`npm run e2e -- --t3-image ...`), catches it before a rollout. |
 
 ## Alternatives considered
@@ -312,5 +385,9 @@ follows `deletionPolicy`:
   surface git's error.
 - **Webhook tasks:** report each task's webhook URL in status, and take the
   signature secret from a Secret reference.
+- **Workflow webhook URLs:** write each hook's URL (`t3 workflow hooks`) into a
+  Secret per T3Workflow, for whatever in the cluster sends to it.
+- **Workflow runs from Kubernetes:** a `kubectl` plugin that finds the pod
+  holding a workflow and runs `t3 workflow` there; or a `T3WorkflowRun` kind.
 - **An informer cache** (`@kubernetes/client-node`), if the operator ever
   manages enough objects that reading everything per pass gets expensive.

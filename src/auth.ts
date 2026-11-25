@@ -41,6 +41,8 @@ export const SESSION_SCOPES = [
   'settings:write',
   'source-control:write',
   'filesystem:read',
+  // Saving and deleting workflow files: code the host runs (T3Workflow).
+  'terminal:operate',
 ] as const;
 
 const UNITS: Record<string, number> = { s: 1000, m: 60_000, h: 3_600_000, d: 86_400_000 };

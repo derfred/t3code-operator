@@ -1,16 +1,17 @@
-// t3code operator: places T3Project resources (and their scheduled tasks) on
-// the environments of the T3EnvironmentSets they select, and gates each
-// environment's readiness on its contents.
+// t3code operator: places T3Project resources (and their scheduled tasks) and
+// T3Workflow resources on the environments of the T3EnvironmentSets they
+// select, and gates each environment's readiness on its projects.
 //
 // A pass reads everything and reconciles everything. Passes run when a watch
-// sees a T3Project, T3EnvironmentSet or t3 pod change (watch.ts), and on a
-// timer for what no watch can see, inside t3: every CLONING_POLL_SECONDS
-// while a clone is under way, else every RESYNC_INTERVAL_SECONDS.
+// sees a T3Project, T3Workflow, T3EnvironmentSet, ConfigMap or t3 pod change
+// (watch.ts), and on a timer for what no watch can see, inside t3: every
+// CLONING_POLL_SECONDS while a clone is under way, else every
+// RESYNC_INTERVAL_SECONDS.
 // Run with Node's built-in type stripping: `node main.ts`.
 
 import { fileCredentials, Sessions, type AuthSpec, type Credentials } from './auth.ts';
 import { Clones } from './clones.ts';
-import { GROUP, VERSION, makeKube } from './kube.ts';
+import { GROUP, KubeError, VERSION, makeKube } from './kube.ts';
 import {
   reconcileEnvironmentSet,
   reconcileProject,
@@ -22,6 +23,7 @@ import {
 } from './reconcile.ts';
 import { makeT3, type T3 } from './t3.ts';
 import { Trigger, watch } from './watch.ts';
+import { PLURAL as WORKFLOWS, reconcileWorkflow, WorkflowHosts, type WorkflowResource } from './workflows.ts';
 
 const required = (name: string) => {
   const value = process.env[name];
@@ -47,6 +49,18 @@ const sessions = new Sessions(kube.exec, () => new Date(), (message, fields) => 
 // ends runs a pass, which records it.
 const trigger = new Trigger();
 const clones = new Clones({ onEnd: () => trigger.notify() });
+
+// The T3Workflows; none while their CustomResourceDefinition isn't installed
+// yet (an operator upgraded before its CRDs), which mustn't stop the rest.
+async function listWorkflows(): Promise<ReadonlyArray<WorkflowResource>> {
+  try {
+    return await kube.list<WorkflowResource>(WORKFLOWS);
+  } catch (error) {
+    if (!(error instanceof KubeError && error.status === 404)) throw error;
+    log('warn', 'T3Workflow CustomResourceDefinition not found; apply the release’s install.yaml');
+    return [];
+  }
+}
 
 // Returns whether a clone is under way somewhere, which shortens the next wait.
 async function pass(): Promise<boolean> {
@@ -118,9 +132,28 @@ async function pass(): Promise<boolean> {
       }
     }
 
+    // Workflows after projects: one waits for its projects to be Ready.
+    const managed = new Map(
+      setResources.flatMap((set) => (set.status?.environments ?? []).filter((e) => e.managesWorkflows === true).map((e) => [e.name, true] as const)),
+    );
+    const hosts = new WorkflowHosts(deps, managed);
+    const projectReady = (env: string, project: string) => (placed.get(env) ?? []).some((p) => p.project === project && p.phase === 'Ready');
+    const holders = new Set<string>();
+    for (const workflow of await listWorkflows()) {
+      let held: ReadonlyArray<string>;
+      try {
+        held = await reconcileWorkflow(deps, workflow, world, hosts, projectReady);
+      } catch (error) {
+        log('error', 'T3Workflow reconcile failed', { name: workflow.metadata.name, error: String(error) });
+        held = (workflow.status?.environments ?? []).map((e) => e.name);
+      }
+      for (const env of held) holders.add(env);
+    }
+    await hosts.release(world, holders);
+
     for (const [i, set] of setResources.entries()) {
       try {
-        await reconcileEnvironmentSet(deps, set, sets[i]!, placed);
+        await reconcileEnvironmentSet(deps, set, sets[i]!, placed, (env) => hosts.manages(env));
       } catch (error) {
         log('error', 'T3EnvironmentSet reconcile failed', { name: set.metadata.name, error: String(error) });
       }
@@ -138,6 +171,10 @@ const custom = `/apis/${GROUP}/${VERSION}/namespaces/${namespace}`;
 const watched = [
   `${custom}/t3projects`,
   `${custom}/t3environmentsets`,
+  `${custom}/t3workflows`,
+  // A T3Workflow's sourceFrom: a changed ConfigMap reaches the pods without
+  // the T3Workflow changing. Other ConfigMaps only cost a pass.
+  `/api/v1/namespaces/${namespace}/configmaps`,
   // Every pod in the namespace: new t3 pods, readiness, scaling. StatefulSet
   // changes all show up here, so they need no watch of their own. Pods of
   // no set only cost a pass that changes nothing.

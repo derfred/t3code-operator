@@ -47,6 +47,8 @@ export interface Kube {
   patchStatus(plural: string, name: string, status: unknown): Promise<void>;
   // null when the StatefulSet does not exist.
   statefulSetEnvironments(name: string): Promise<ReadonlyArray<Environment> | null>;
+  // A ConfigMap's data; null when it does not exist.
+  configMapData(name: string): Promise<Readonly<Record<string, string>> | null>;
   setContentReady(pod: string, ready: boolean, message: string): Promise<void>;
   // Runs a command in a pod's container (pods/exec); its stdout, or an error
   // when it can't run or exits non-zero. For Session auth (auth.ts).
@@ -152,6 +154,14 @@ export function makeKube(namespace: string): Kube {
       return pods.items
         .map(toEnvironment)
         .sort((a: Environment, b: Environment) => a.name.localeCompare(b.name, 'en', { numeric: true }));
+    },
+    configMapData: async (name) => {
+      try {
+        return (await request('GET', `/api/v1/namespaces/${namespace}/configmaps/${encodeURIComponent(name)}`)).data ?? {};
+      } catch (error) {
+        if (error instanceof KubeError && error.status === 404) return null;
+        throw error;
+      }
     },
     exec: async (pod, container, command) => {
       const query = new URLSearchParams({ container, stdout: 'true', stderr: 'true' });

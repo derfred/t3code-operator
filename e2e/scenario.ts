@@ -15,6 +15,8 @@ const pods = `/api/v1/namespaces/${NAMESPACE}/pods`;
 const statefulSets = `/apis/apps/v1/namespaces/${NAMESPACE}/statefulsets`;
 const sets = `/apis/t3code.derfred.com/v1alpha1/namespaces/${NAMESPACE}/t3environmentsets`;
 const projects = `/apis/t3code.derfred.com/v1alpha1/namespaces/${NAMESPACE}/t3projects`;
+const workflows = `/apis/t3code.derfred.com/v1alpha1/namespaces/${NAMESPACE}/t3workflows`;
+const configMaps = `/api/v1/namespaces/${NAMESPACE}/configmaps`;
 const GATE = 't3code.derfred.com/content-ready';
 
 export interface Context {
@@ -153,6 +155,51 @@ export async function run({ api, t3, podIP, remote, workspace, exec, replaceFile
     return now.length === 1 && now[0].sessionId !== session.sessionId ? now[0] : undefined;
   });
   step(`a recreated pod issued session ${renewed.sessionId}; the earlier one was revoked`);
+
+  // A T3Workflow from a ConfigMap, under Session auth (terminal:operate):
+  // the operator turns t3's workflows on, saves k8s-e2e.ts, follows a change
+  // to the ConfigMap, and on deletion removes the file and turns workflows
+  // off again.
+  const source = (version: number) => `const { workflow, step } = T3;
+workflow("e2e", { version: ${version}, payload: Schema.Struct({}) }, Effect.fn(function* () {
+  return yield* step("hello", { returns: Schema.String }, Effect.succeed("hello"));
+}));
+`;
+  const definition = async () =>
+    ((await t3.call('workflows.getDefinition', {})) as any).files.find((f: any) => f.name === 'k8s-e2e.ts');
+  const workflowsEnabled = async () => ((await t3.call('server.getConfig', {})) as any).settings.workflowsEnabled;
+  assert.equal(await workflowsEnabled(), false, 'workflows start off');
+  api.create(configMaps, { metadata: { name: 'workflow-e2e' }, data: { 'e2e.ts': source(1) } });
+  api.create(workflows, {
+    metadata: { name: 'e2e' },
+    spec: {
+      sourceFrom: { configMapKeyRef: { name: 'workflow-e2e', key: 'e2e.ts' } },
+      environmentSetSelector: { matchLabels: { trust: 'test' } },
+      projects: ['e2e'],
+    },
+  });
+  const placedWorkflow = await until('the T3Workflow to be Ready', 30_000, () => {
+    const w = api.get(workflows, 'e2e');
+    return w?.status?.conditions?.find((c: any) => c.type === 'Ready')?.status === 'True' ? w : undefined;
+  });
+  assert.deepEqual(placedWorkflow.status.environments.map((e: any) => [e.name, e.workflows]), [['t3-e2e-0', ['e2e@1']]]);
+  assert.equal(await workflowsEnabled(), true);
+  assert.equal((await definition())?.source, source(1));
+  await until('the T3EnvironmentSet to record it turned workflows on', 15_000, () =>
+    api.get(sets, 'e2e')?.status?.environments?.[0]?.managesWorkflows === true,
+  );
+  step('T3Workflow Ready: workflows on, k8s-e2e.ts in t3');
+
+  api.patch(configMaps, 'workflow-e2e', { data: { 'e2e.ts': source(2) } });
+  const changed = Date.now();
+  await until('the ConfigMap change in t3', 10_000, async () => (await definition())?.workflows?.includes('e2e@2'));
+  step(`a ConfigMap change reached t3 in ${Date.now() - changed}ms`);
+
+  api.delete(workflows, 'e2e');
+  await until('the T3Workflow to be gone', 30_000, () => api.get(workflows, 'e2e') === undefined);
+  assert.equal(await definition(), undefined, 'k8s-e2e.ts removed');
+  await until('workflows to be off again', 15_000, async () => (await workflowsEnabled()) === false);
+  step('deleting the T3Workflow removed its file and turned workflows off again');
 
   // A repository git can't clone: t3 reports the failure (read from its
   // clone stream), and the project turns Error without holding the gate.

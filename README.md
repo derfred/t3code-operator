@@ -5,6 +5,7 @@ A Kubernetes operator for [T3 Code](https://github.com/pingdotgg/t3code) environ
 - **Projects**: it creates/updates the projects on every pod. You only connect to the pod once and the operator ensures it contains current clones. Using an `environmentSetSelector` you can control the placement.
 - **Readiness**: pods (optionally) declare the readiness gate `t3code.derfred.com/content-ready` and become Ready only once all projects placed on them are present.
 - **Tasks**: manage scheduled tasks via the kubernetes manifest.
+- **Workflows**: put t3 workflow files on the pods from a `T3Workflow`, inline or from a ConfigMap (so from git), and turn t3's workflows on where they go.
 - **Failed clones**: broken git urls show up as `Error` in the environment's entry.
 
 The pods are managed by a StatefulSet, not the operator. Design and trade-offs: [docs/design.md](docs/design.md).
@@ -32,7 +33,7 @@ kubectl apply -f https://raw.githubusercontent.com/derfred/t3code-operator/v0.2.
 ```
 
 The manifest [`deploy/install.yaml`](deploy/install.yaml) sets up the
-namespace `t3code`, the two CustomResourceDefinitions, and the operator
+namespace `t3code`, the three CustomResourceDefinitions, and the operator
 (ServiceAccount, Role, RoleBinding, Deployment). How the operator authenticates to the t3 pods is chosen per set (see [Auth](#auth)): with `File`, the default, it needs a token for each StatefulSet in Secret `t3code-operator-tokens`; with `Session`, it needs `session-auth.yaml` applied as well.
 
 For more customizability use the jsonnet library.  Vendor it at a release tag with jsonnet-bundler (`jb install github.com/derfred/t3code-operator/deploy/jsonnet@v0.2.0`), then:
@@ -149,7 +150,7 @@ spec:
       spec: { accessModes: [ReadWriteOnce], resources: { requests: { storage: 20Gi } } }
 ```
 
-`kubectl -n t3code get t3projects,t3environmentsets` shows where everything
+`kubectl -n t3code get t3projects,t3workflows,t3environmentsets` shows where everything
 stands; each resource's status lists every environment with its phase
 (`Waiting`, `Cloning`, `Ready`, `Error`) and message.
 
@@ -197,6 +198,77 @@ spec:
 - **Worktree threads** get a worktree of every repository (of none, above
   eight, until you choose); a task names the ones it wants in
   `workspaceStrategy`: `{type: worktree, baseRef: main, repositories: [{path: /workspace/shop/api}]}`.
+
+## Workflows
+
+A [t3 workflow](https://github.com/pingdotgg/t3code/blob/main/docs/user/workflows.md)
+is a TypeScript file that t3 runs durably: agents, schedules, webhooks, issue
+and pull request triggers, and questions to you. A `T3Workflow` puts one file,
+`k8s-<name>.ts`, into the workflows folder of the pods it selects, and turns
+t3's workflows (a Labs setting, off by default) on there. Needs t3 0.1.12 or
+later.
+
+```yaml
+apiVersion: t3code.derfred.com/v1alpha1
+kind: T3Workflow
+metadata:
+  name: bug-triage
+  namespace: t3code
+spec:
+  sourceFrom:                       # or `source: |` with the file inline
+    configMapKeyRef: { name: workflow-bug-triage, key: bug-triage.ts }
+  environmentSetSelector:           # default {}: every set
+    matchLabels: { tier: team }
+  placement: One                    # One (default) | EachEnvironment
+  projects: [my-app]                # placed only where these T3Projects are Ready
+  # deletionPolicy: Delete          # Delete (default) | Retain
+```
+
+Refer to projects by their folder (`project: "/workspace/my-app"`): it is the
+same on every pod, where the project ID is not.
+
+- **`placement: One`** keeps the file on one pod, across restarts. A
+  workflow's runs, schedules and webhook URLs live in that pod's database, so
+  a workflow with triggers belongs on one pod. `EachEnvironment` puts it on
+  every pod, and its triggers fire on each.
+- **Updates.** The operator saves the file wherever it is missing or differs,
+  so an edit in the t3 app is undone on the next pass. t3 checks the file
+  first: a file that doesn't load, or that drops a version while runs of it
+  are open, is refused, and the pod keeps the file it had. The T3Workflow is
+  then `Degraded`, with t3's reason, until the file is fixed or the runs end.
+  So to change a live workflow, add `version: 2` beside `version: 1` in the
+  file, and drop `version: 1` once `activeRuns` is 0.
+- **Deletion** removes the file (unless `deletionPolicy: Retain`), once the
+  workflow's runs have ended: until then t3 refuses, and the T3Workflow waits
+  as `Deleting`. Where the operator turned workflows on and no file is left,
+  it turns them off again.
+- **Status** has a `Ready` condition, for `kubectl wait --for=condition=Ready`
+  and Flux's health checks, and per pod what t3 loaded (`name@version`), its
+  problems, `activeRuns`, and `needsYou` (open questions and paused runs).
+- **Runs** are started, answered, resumed and cancelled in t3: the app's
+  Workflows page, `kubectl exec <pod> -c t3 -- t3 workflow …`, or the
+  workflow's own triggers.
+
+### From git, with Flux
+
+Keep the script next to the manifests and have kustomize make the ConfigMap.
+The operator watches ConfigMaps, so a merged change reaches the pod within a
+second of Flux applying it:
+
+```yaml
+# kustomization.yaml, beside bug-triage.ts and bug-triage.yaml (the T3Workflow)
+namespace: t3code
+resources: [bug-triage.yaml]
+configMapGenerator:
+  - name: workflow-bug-triage
+    files: [bug-triage.ts]
+generatorOptions:
+  disableNameSuffixHash: true   # the T3Workflow names the ConfigMap as it is
+```
+
+The same works from a repository of its own: a Flux `GitRepository` for it,
+and a `Kustomization` pointing at its path, with `wait: true` so a file t3
+refuses fails the Kustomization.
 
 ## Auth
 
@@ -265,8 +337,9 @@ needs no running server. It keeps the token in memory:
 - **One token per pod.** t3 signs it with a key in the pod's data directory
   (`~/.t3`), so only that pod accepts it. Any number of replicas works.
 - **Only the scopes it uses:** `orchestration:read`, `orchestration:operate`,
-  `settings:write`, `source-control:write`, `filesystem:read`. Under subject
-  `t3code-operator`, in `t3 auth session list`.
+  `settings:write`, `source-control:write`, `filesystem:read`, and
+  `terminal:operate` (saving workflow files, which are code the pod runs).
+  Under subject `t3code-operator`, in `t3 auth session list`.
 - **Renewed halfway through its `ttl`**, for a recreated pod, or when t3
   refuses it (a replaced data directory). The operator then revokes the earlier
   tokens with subject `t3code-operator`, including those an earlier run of the

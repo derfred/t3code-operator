@@ -53,25 +53,27 @@ local version = (import 'version.json').version;
     },
   },
 
-  crds: [crds.environmentSets, crds.projects],
+  crds: [crds.environmentSets, crds.projects, crds.workflows],
 
   // What the operator does in its namespace: its own kinds, the
-  // StatefulSets they name, their pods, and the pods' content-ready
-  // condition. No Secrets, and no exec: that is sessionAuth's.
+  // StatefulSets they name, their pods, the pods' content-ready condition,
+  // and the ConfigMaps T3Workflows read their source from. No Secrets, and
+  // no exec: that is sessionAuth's.
   rules: [
     {
       apiGroups: ['t3code.derfred.com'],
-      resources: ['t3projects', 't3environmentsets'],
+      resources: ['t3projects', 't3environmentsets', 't3workflows'],
       verbs: ['get', 'list', 'watch', 'patch', 'update'],
     },
     {
       apiGroups: ['t3code.derfred.com'],
-      resources: ['t3projects/status', 't3environmentsets/status'],
+      resources: ['t3projects/status', 't3environmentsets/status', 't3workflows/status'],
       verbs: ['get', 'patch', 'update'],
     },
     { apiGroups: ['apps'], resources: ['statefulsets'], verbs: ['get'] },
     { apiGroups: [''], resources: ['pods'], verbs: ['get', 'list', 'watch'] },
     { apiGroups: [''], resources: ['pods/status'], verbs: ['patch'] },
+    { apiGroups: [''], resources: ['configmaps'], verbs: ['get', 'list', 'watch'] },
   ],
 
   // Session auth (README.md, Auth): a Role and RoleBinding that let the

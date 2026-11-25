@@ -160,4 +160,49 @@ local task = {
     },
     [{ name: 'Repository', type: 'string', jsonPath: '.spec.repository' }],
   ),
+
+  workflows: crd(
+    'T3Workflow',
+    {
+      description: 'A t3 workflow file, k8s-<name>.ts in the workflows folder of the T3 home, placed on the environments of the T3EnvironmentSets it selects. t3 runs it; the operator turns t3’s workflows on where it places one. See README.md, Workflows.',
+      'x-kubernetes-validations': [
+        { rule: 'has(self.source) != has(self.sourceFrom)', message: 'set exactly one of source and sourceFrom' },
+      ],
+      properties: {
+        source: string('The workflow file’s contents: TypeScript, as t3’s workflows folder takes it.'),
+        sourceFrom: {
+          type: 'object',
+          description: 'Where to read the file’s contents instead: a key of a ConfigMap in this namespace. A change to the ConfigMap reaches the environments without one to the T3Workflow.',
+          required: ['configMapKeyRef'],
+          properties: {
+            configMapKeyRef: {
+              type: 'object',
+              required: ['name', 'key'],
+              properties: { name: string(), key: string() },
+            },
+          },
+        },
+        environmentSetSelector: labelSelector('T3EnvironmentSets whose environments may hold the workflow. Default {}: all of them.') { default: {} },
+        placement: enum(
+          ['One', 'EachEnvironment'],
+          default='One',
+          description='One: a single environment holds the workflow, and keeps it across pod restarts: its runs, schedules and hook URLs live there. EachEnvironment: every one does, and its triggers fire on each.',
+        ),
+        projects: {
+          type: 'array',
+          description: 'T3Projects that must be Ready on an environment before the workflow is placed there: those its agent steps work in.',
+          items: string(),
+        },
+        deletionPolicy: enum(
+          ['Delete', 'Retain'],
+          default='Delete',
+          description='When the T3Workflow is deleted: Delete removes the file from its environments, once runs of the versions it defines have ended (t3 refuses before); Retain leaves it.',
+        ),
+      },
+    },
+    [
+      { name: 'Placement', type: 'string', jsonPath: '.spec.placement' },
+      { name: 'Ready', type: 'string', jsonPath: '.status.conditions[?(@.type=="Ready")].status' },
+    ],
+  ),
 }
