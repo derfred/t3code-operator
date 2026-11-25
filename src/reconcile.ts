@@ -37,7 +37,7 @@ export interface TaskSpec {
   readonly threadMode?: string;
   // Narrows the project's selector; {} adds nothing.
   readonly environmentSetSelector?: LabelSelector;
-  readonly placement?: 'One' | 'EachEnvironment';
+  readonly placement?: Placement;
 }
 
 // One repository of a multi-repository project (spec.repositories).
@@ -119,7 +119,10 @@ export interface ProjectStatus {
 }
 
 export type ProjectResource = Resource<ProjectSpec, ProjectStatus>;
-export type EnvironmentSetResource = Resource<{ readonly statefulSet: string; readonly auth?: AuthSpec }, unknown>;
+export type EnvironmentSetResource = Resource<
+  { readonly statefulSet: string; readonly auth?: AuthSpec },
+  { readonly environments?: ReadonlyArray<{ readonly name: string; readonly managesWorkflows?: boolean }> }
+>;
 
 // What one pass observed: every set with its environments (null when its
 // StatefulSet is missing).
@@ -193,9 +196,9 @@ export function repositoriesOf(cr: ProjectResource): ReadonlyArray<ResolvedRepos
   return resolved;
 }
 
-const errorMessage = (error: unknown) => (error instanceof Error ? error.message : String(error));
-const hash = (value: unknown) => createHash('sha256').update(JSON.stringify(value)).digest('hex').slice(0, 16);
-const byName = (a: string, b: string) => a.localeCompare(b, 'en', { numeric: true });
+export const errorMessage = (error: unknown) => (error instanceof Error ? error.message : String(error));
+export const hash = (value: unknown) => createHash('sha256').update(JSON.stringify(value)).digest('hex').slice(0, 16);
+export const byName = (a: string, b: string) => a.localeCompare(b, 'en', { numeric: true });
 
 export function environmentStatus(
   fields: Partial<EnvironmentStatus> & Pick<EnvironmentStatus, 'name' | 'environmentSet' | 'phase'>,
@@ -240,6 +243,27 @@ export function pickOne(task: string, candidates: ReadonlyArray<string>): string
   return sorted[Number.parseInt(hash(task).slice(0, 8), 16) % sorted.length]!;
 }
 
+export type Placement = 'One' | 'EachEnvironment';
+
+// Where a task or workflow goes. `candidates` are the environments it may be
+// on, `eligible` those of them ready for it now, `holding` those that have it
+// already. An environment that holds it keeps it while it is a candidate,
+// ready or not: moving it restarts its work elsewhere, which a pod restart
+// must not cause.
+export function choosePlacement(
+  key: string,
+  placement: Placement | undefined,
+  candidates: ReadonlyArray<string>,
+  eligible: ReadonlyArray<string>,
+  holding: ReadonlyArray<string>,
+): string[] {
+  const kept = holding.filter((n) => candidates.includes(n));
+  if ((placement ?? 'One') === 'One') {
+    return kept.length > 0 ? [[...kept].sort(byName)[0]!] : eligible.length > 0 ? [pickOne(key, eligible)] : [];
+  }
+  return [...new Set([...eligible, ...kept])].sort(byName);
+}
+
 // Status as the API server hands it back: object keys sorted (it is a Go map
 // there), and null fields gone (a merge patch deletes them). Inside arrays,
 // which a merge patch replaces whole, nulls survive.
@@ -254,7 +278,7 @@ export function canonical(value: unknown): unknown {
   );
 }
 
-async function writeStatus(deps: Deps, plural: string, cr: Resource<unknown, any>, status: Record<string, unknown>) {
+export async function writeStatus(deps: Deps, plural: string, cr: Resource<unknown, any>, status: Record<string, unknown>) {
   const next = { observedGeneration: cr.metadata.generation ?? null, ...status };
   // Unchanged: skip the write. Not just to save API calls: the operator
   // watches its own resources, so every write is another pass.
@@ -262,15 +286,15 @@ async function writeStatus(deps: Deps, plural: string, cr: Resource<unknown, any
   await deps.kube.patchStatus(plural, cr.metadata.name, next);
 }
 
-async function addFinalizer(deps: Deps, cr: ProjectResource) {
+export async function addFinalizer(deps: Deps, cr: Resource<unknown, unknown>, plural = 't3projects') {
   if (cr.metadata.finalizers?.includes(FINALIZER)) return;
-  await deps.kube.patch('t3projects', cr.metadata.name, {
+  await deps.kube.patch(plural, cr.metadata.name, {
     metadata: { resourceVersion: cr.metadata.resourceVersion, finalizers: [...(cr.metadata.finalizers ?? []), FINALIZER] },
   });
 }
 
-async function removeFinalizer(deps: Deps, cr: ProjectResource) {
-  await deps.kube.patch('t3projects', cr.metadata.name, {
+export async function removeFinalizer(deps: Deps, cr: Resource<unknown, unknown>, plural = 't3projects') {
+  await deps.kube.patch(plural, cr.metadata.name, {
     metadata: {
       resourceVersion: cr.metadata.resourceVersion,
       finalizers: (cr.metadata.finalizers ?? []).filter((f) => f !== FINALIZER),
@@ -681,15 +705,7 @@ async function placeTasks(
         .filter((e) => targeted.has(e.name) && matches(spec.environmentSetSelector, world.labelsOf(e.environmentSet)))
         .map((e) => e.name);
       const eligible = candidates.filter((n) => entries.get(n)!.phase === 'Ready' && entries.get(n)!.projectId !== null);
-      // An environment that holds the task keeps it while it is a candidate,
-      // ready or not: moving a task restarts its thread elsewhere, which a
-      // pod restart must not cause.
-      const kept = holding.filter((n) => candidates.includes(n));
-      if ((spec.placement ?? 'One') === 'One') {
-        chosen = kept.length > 0 ? [kept.sort(byName)[0]!] : eligible.length > 0 ? [pickOne(task, eligible)] : [];
-      } else {
-        chosen = [...new Set([...eligible, ...kept])].sort(byName);
-      }
+      chosen = choosePlacement(task, spec.placement, candidates, eligible, holding);
       if (chosen.length === 0) {
         message = candidates.length === 0 ? 'no environment set matches' : 'waiting for the project on a matching environment';
       }
@@ -864,11 +880,14 @@ export function holdsGate(p: Placed, now: Date): boolean {
 }
 
 // Sets each environment's content-ready gate and the set's status.
+// `managesWorkflows` says where the operator turned t3's workflows on
+// (workflows.ts), which the status keeps from pass to pass.
 export async function reconcileEnvironmentSet(
   deps: Deps,
   cr: EnvironmentSetResource,
   set: PlacedSet,
   projects: ReadonlyMap<string, ReadonlyArray<Placed>>,
+  managesWorkflows: (environment: string) => boolean = () => false,
 ): Promise<void> {
   if (set.environments === null) {
     await writeStatus(deps, 't3environmentsets', cr, {
@@ -896,6 +915,7 @@ export async function reconcileEnvironmentSet(
       ready: env.ready,
       contentReady,
       projects: placed.map((p) => ({ name: p.project, phase: p.phase })),
+      ...(managesWorkflows(env.name) ? { managesWorkflows: true } : {}),
     });
   }
   await writeStatus(deps, 't3environmentsets', cr, {

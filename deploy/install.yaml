@@ -288,6 +288,122 @@ spec:
     subresources:
       status: {}
 ---
+apiVersion: "apiextensions.k8s.io/v1"
+kind: "CustomResourceDefinition"
+metadata:
+  name: "t3workflows.t3code.derfred.com"
+spec:
+  group: "t3code.derfred.com"
+  names:
+    kind: "T3Workflow"
+    listKind: "T3WorkflowList"
+    plural: "t3workflows"
+    singular: "t3workflow"
+  scope: "Namespaced"
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: ".spec.placement"
+      name: "Placement"
+      type: "string"
+    - jsonPath: ".status.conditions[?(@.type==\"Ready\")].status"
+      name: "Ready"
+      type: "string"
+    - jsonPath: ".status.phase"
+      name: "Phase"
+      type: "string"
+    - jsonPath: ".metadata.creationTimestamp"
+      name: "Age"
+      type: "date"
+    name: "v1alpha1"
+    schema:
+      openAPIV3Schema:
+        properties:
+          spec:
+            description: "A t3 workflow file, k8s-<name>.ts in the workflows folder of the T3 home, placed on the environments of the T3EnvironmentSets it selects. t3 runs it; the operator turns t3’s workflows on where it places one. See README.md, Workflows."
+            properties:
+              deletionPolicy:
+                default: "Delete"
+                description: "When the T3Workflow is deleted: Delete removes the file from its environments, once runs of the versions it defines have ended (t3 refuses before); Retain leaves it."
+                enum:
+                - "Delete"
+                - "Retain"
+                type: "string"
+              environmentSetSelector:
+                default: {}
+                description: "T3EnvironmentSets whose environments may hold the workflow. Default {}: all of them."
+                properties:
+                  matchExpressions:
+                    items:
+                      properties:
+                        key:
+                          type: "string"
+                        operator:
+                          enum:
+                          - "In"
+                          - "NotIn"
+                          - "Exists"
+                          - "DoesNotExist"
+                          type: "string"
+                        values:
+                          items:
+                            type: "string"
+                          type: "array"
+                      required:
+                      - "key"
+                      - "operator"
+                      type: "object"
+                    type: "array"
+                  matchLabels:
+                    additionalProperties:
+                      type: "string"
+                    type: "object"
+                type: "object"
+              placement:
+                default: "One"
+                description: "One: a single environment holds the workflow, and keeps it across pod restarts: its runs, schedules and hook URLs live there. EachEnvironment: every one does, and its triggers fire on each."
+                enum:
+                - "One"
+                - "EachEnvironment"
+                type: "string"
+              projects:
+                description: "T3Projects that must be Ready on an environment before the workflow is placed there: those its agent steps work in."
+                items:
+                  type: "string"
+                type: "array"
+              source:
+                description: "The workflow file’s contents: TypeScript, as t3’s workflows folder takes it."
+                type: "string"
+              sourceFrom:
+                description: "Where to read the file’s contents instead: a key of a ConfigMap in this namespace. A change to the ConfigMap reaches the environments without one to the T3Workflow."
+                properties:
+                  configMapKeyRef:
+                    properties:
+                      key:
+                        type: "string"
+                      name:
+                        type: "string"
+                    required:
+                    - "name"
+                    - "key"
+                    type: "object"
+                required:
+                - "configMapKeyRef"
+                type: "object"
+            type: "object"
+            x-kubernetes-validations:
+            - message: "set exactly one of source and sourceFrom"
+              rule: "has(self.source) != has(self.sourceFrom)"
+          status:
+            type: "object"
+            x-kubernetes-preserve-unknown-fields: true
+        required:
+        - "spec"
+        type: "object"
+    served: true
+    storage: true
+    subresources:
+      status: {}
+---
 apiVersion: "v1"
 kind: "ServiceAccount"
 metadata:
@@ -309,6 +425,7 @@ rules:
   resources:
   - "t3projects"
   - "t3environmentsets"
+  - "t3workflows"
   verbs:
   - "get"
   - "list"
@@ -320,6 +437,7 @@ rules:
   resources:
   - "t3projects/status"
   - "t3environmentsets/status"
+  - "t3workflows/status"
   verbs:
   - "get"
   - "patch"
@@ -344,6 +462,14 @@ rules:
   - "pods/status"
   verbs:
   - "patch"
+- apiGroups:
+  - ""
+  resources:
+  - "configmaps"
+  verbs:
+  - "get"
+  - "list"
+  - "watch"
 ---
 apiVersion: "rbac.authorization.k8s.io/v1"
 kind: "RoleBinding"
