@@ -20,7 +20,8 @@ export interface T3Project {
 export interface T3 {
   listProjects(): Promise<ReadonlyArray<T3Project>>;
   mutateProject(mutation: Record<string, unknown>): Promise<void>;
-  call(method: string, payload: unknown): Promise<unknown>;
+  // timeoutMs: how long to wait for the answer. Default CALL_TIMEOUT_MS.
+  call(method: string, payload: unknown, options?: { readonly timeoutMs?: number }): Promise<unknown>;
   // A stream method's first value (subscriptions start with the current
   // state); undefined if the stream ends without one.
   first(method: string, payload: unknown): Promise<unknown>;
@@ -39,7 +40,7 @@ export class T3Error extends Error {
 // t3 orchestration protocol the /ws endpoint insists on. Bump with t3 when a
 // release changes it; the server answers 426 to anything else.
 const ORCHESTRATION_PROTOCOL = '2';
-const CALL_TIMEOUT_MS = 60_000;
+export const CALL_TIMEOUT_MS = 60_000;
 
 type Pending = {
   readonly resolve: (value: unknown) => void;
@@ -159,7 +160,7 @@ export function makeT3(origin: string, auth: string | Credentials): T3 {
   };
 
   // One request: settled by its Exit, or by a stream's first Chunk.
-  const request = async (method: string, payload: unknown): Promise<unknown> => {
+  const request = async (method: string, payload: unknown, timeoutMs = CALL_TIMEOUT_MS): Promise<unknown> => {
     socket ??= connect();
     let ws: WebSocket;
     try {
@@ -173,7 +174,7 @@ export function makeT3(origin: string, auth: string | Credentials): T3 {
       const timer = setTimeout(() => {
         pending.delete(id);
         reject(new T3Error(`${method} timed out`));
-      }, CALL_TIMEOUT_MS);
+      }, timeoutMs);
       pending.set(id, { resolve, reject, timer });
       ws.send(JSON.stringify({ _tag: 'Request', id, tag: method, payload, headers: [] }));
     });
@@ -184,8 +185,8 @@ export function makeT3(origin: string, auth: string | Credentials): T3 {
     mutateProject: async (mutation) => {
       await http('POST', '/api/projects/mutate', mutation);
     },
-    call: request,
-    first: request,
+    call: (method, payload, options) => request(method, payload, options?.timeoutMs),
+    first: (method, payload) => request(method, payload),
     close: () => {
       const current = socket;
       socket = undefined;

@@ -6,7 +6,9 @@
 // environments hold their definitions. See docs/design.md.
 
 import { createHash, randomUUID } from 'node:crypto';
+import { posix } from 'node:path';
 import type { AuthSpec } from './auth.ts';
+import type { Clones } from './clones.ts';
 import type { Environment, Kube, Resource } from './kube.ts';
 import { matches, type LabelSelector } from './selector.ts';
 import type { T3, T3Project } from './t3.ts';
@@ -38,8 +40,21 @@ export interface TaskSpec {
   readonly placement?: 'One' | 'EachEnvironment';
 }
 
+// One repository of a multi-repository project (spec.repositories).
+export interface RepositorySpec {
+  readonly url: string;
+  // Relative: inside the project folder, where t3 finds it by itself.
+  // Absolute, outside the project folder: added to the project as a tracked
+  // folder. Default: the repository's name, inside the project folder.
+  readonly path?: string;
+}
+
 export interface ProjectSpec {
-  readonly repository: string;
+  // Exactly one of the two. repository: the project folder is its clone.
+  // repositories: the project folder is a plain folder, and each one is
+  // cloned into it (or elsewhere, and tracked).
+  readonly repository?: string;
+  readonly repositories?: Readonly<Record<string, RepositorySpec>>;
   readonly path?: string;
   readonly title?: string;
   readonly project?: Record<string, unknown>;
@@ -72,6 +87,21 @@ export interface EnvironmentStatus {
   // old URL from one of the current.
   readonly repository: string | null;
   readonly tasks: ReadonlyArray<TaskPlacement>;
+  // Multi-repository projects only: each repository on this environment,
+  // and the folders outside the project folder the operator tracks in it.
+  readonly repositories?: ReadonlyArray<RepositoryStatus>;
+  readonly trackedFolders?: ReadonlyArray<string>;
+}
+
+export interface RepositoryStatus {
+  readonly name: string;
+  readonly path: string;
+  readonly phase: Phase;
+  readonly message: string | null;
+  // The URL it was cloned from.
+  readonly repository: string | null;
+  // Cloning: since when. Error: when the clone failed.
+  readonly since: string | null;
 }
 
 export interface TaskStatus {
@@ -102,6 +132,9 @@ export interface PlacedSet {
 export interface Deps {
   readonly kube: Kube;
   readonly t3: (environment: string) => T3;
+  // A connection of its own, for a call that outlives the pass (a clone).
+  readonly connect: (environment: string) => T3;
+  readonly clones: Clones;
   readonly now: () => Date;
 }
 
@@ -111,6 +144,54 @@ export const projectIdFor = (name: string) => `k8s-${name}`;
 const isOwnId = (name: string, id: string) => id === projectIdFor(name) || new RegExp(`^${projectIdFor(name)}-[0-9a-f]{8}$`).test(id);
 export const taskIdFor = (project: string, task: string) => `k8s-${project}-${task}`;
 export const workspaceRootFor = (cr: ProjectResource) => cr.spec.path ?? `/workspace/${cr.metadata.name}`;
+
+// The single repository of a project, which spec.repositories does not have.
+function repositoryOf(cr: ProjectResource): string {
+  if (cr.spec.repository === undefined) throw new Error('spec needs repository or repositories');
+  return cr.spec.repository;
+}
+
+export interface ResolvedRepository {
+  readonly name: string;
+  readonly url: string;
+  // Absolute.
+  readonly path: string;
+  // Outside the project folder: tracked in the project, as t3 doesn't find it.
+  readonly tracked: boolean;
+}
+
+const within = (parent: string, child: string) => {
+  const relative = posix.relative(parent, child);
+  return relative === '' || (relative !== '..' && !relative.startsWith('../'));
+};
+
+// spec.repositories with their paths resolved, by name; null for a
+// single-repository project. Throws on a spec t3 couldn't follow.
+export function repositoriesOf(cr: ProjectResource): ReadonlyArray<ResolvedRepository> | null {
+  if (cr.spec.repositories === undefined) return null;
+  if (cr.spec.repository !== undefined) throw new Error('spec has both repository and repositories; give one');
+  const root = posix.normalize(workspaceRootFor(cr));
+  const resolved = Object.entries(cr.spec.repositories)
+    .sort(([a], [b]) => byName(a, b))
+    .map(([name, spec]) => {
+      const given = spec.path ?? name;
+      const path = posix.isAbsolute(given) ? posix.normalize(given) : posix.join(root, given);
+      if (path === root) throw new Error(`repository ${name}: ${path} is the project folder itself`);
+      if (within(path, root)) throw new Error(`repository ${name}: ${path} contains the project folder ${root}`);
+      const inside = within(root, path);
+      // t3 looks one level down, and one more inside folders that aren't
+      // repositories themselves.
+      if (inside && posix.relative(root, path).split('/').length > 2) {
+        throw new Error(`repository ${name}: ${path} is more than two levels inside ${root}, deeper than t3 looks for repositories`);
+      }
+      return { name, url: spec.url, path, tracked: !inside };
+    });
+  for (const [i, repo] of resolved.entries()) {
+    const other = resolved.slice(0, i).find((r) => within(r.path, repo.path) || within(repo.path, r.path));
+    if (other) throw new Error(`repositories ${other.name} and ${repo.name}: ${other.path} and ${repo.path} overlap`);
+  }
+  return resolved;
+}
 
 const errorMessage = (error: unknown) => (error instanceof Error ? error.message : String(error));
 const hash = (value: unknown) => createHash('sha256').update(JSON.stringify(value)).digest('hex').slice(0, 16);
@@ -205,7 +286,7 @@ async function startClone(t3: T3, cr: ProjectResource, projectId: string, now: D
     projectId,
     title: cr.spec.title ?? cr.metadata.name,
     createdAt: now.toISOString(),
-    remoteUrl: cr.spec.repository,
+    remoteUrl: repositoryOf(cr),
     destinationPath: workspaceRootFor(cr),
   })) as { projectId?: string } | undefined;
   return started?.projectId ?? projectId;
@@ -261,12 +342,14 @@ async function syncProject(
   const name = cr.metadata.name;
   const root = workspaceRootFor(cr);
   const title = cr.spec.title ?? name;
+  const repositories = repositoriesOf(cr);
   const carried = {
     name: env.name,
     environmentSet: set,
     podUID: env.uid,
     managesSettings: previous?.managesSettings ?? false,
     tasks: previous?.tasks ?? [],
+    ...(repositories === null ? {} : { trackedFolders: previous?.trackedFolders ?? [] }),
   };
   const cloningSince = previous?.phase === 'Cloning' && previous.cloningSince ? previous.cloningSince : now.toISOString();
   const cloning = (projectId: string, repository: string, since = cloningSince) =>
@@ -287,26 +370,57 @@ async function syncProject(
   let project: Pick<T3Project, 'id'> | undefined =
     live.find((p) => p.id === (previous?.projectId ?? projectIdFor(name))) ?? live.find((p) => p.workspaceRoot === root);
 
-  if (!project) {
+  const create = (createWorkspaceRootIfMissing: boolean) =>
+    withFreshId(name, known, async (id) => {
+      await t3.mutateProject({
+        type: 'project.create',
+        commandId: randomUUID(),
+        projectId: id,
+        title,
+        workspaceRoot: root,
+        ...(createWorkspaceRootIfMissing ? { createWorkspaceRootIfMissing } : {}),
+      });
+      return id;
+    });
+
+  if (!project && repositories !== null) {
+    // A plain folder: registered as it is, the repositories cloned into it.
+    project = { id: await create(true) };
+  } else if (!project) {
     try {
       const started = await withFreshId(name, known, (id) => startClone(t3, cr, id, now));
-      return cloning(started, cr.spec.repository);
+      return cloning(started, repositoryOf(cr));
     } catch (error) {
       // A checkout already on disk is registered as it is, not re-cloned.
       if (!/not empty/i.test(errorMessage(error))) throw error;
-      const id = await withFreshId(name, known, async (id) => {
-        await t3.mutateProject({ type: 'project.create', commandId: randomUUID(), projectId: id, title, workspaceRoot: root });
-        return id;
-      });
-      project = { id };
+      project = { id: await create(false) };
     }
   }
   const projectId = project.id;
 
-  // projectClone.start registers the project before git runs, so an existing
-  // project can still be an unfinished or failed clone. Check until it has
-  // files once; after that it is Ready and the check is skipped.
-  if (previous?.phase !== 'Ready' || previous.projectId !== projectId) {
+  let repositoryStatuses: ReadonlyArray<RepositoryStatus> | undefined;
+  if (repositories !== null) {
+    repositoryStatuses = await syncRepositories(deps, env, repositories, previous);
+    const failed = repositoryStatuses.filter((r) => r.phase === 'Error');
+    const underway = repositoryStatuses.filter((r) => r.phase === 'Cloning');
+    if (failed.length > 0 || underway.length > 0) {
+      return environmentStatus({
+        ...carried,
+        phase: failed.length > 0 ? 'Error' : 'Cloning',
+        projectId,
+        repositories: repositoryStatuses,
+        cloningSince: underway.map((r) => r.since!).sort()[0] ?? null,
+        message:
+          failed.length > 0
+            ? failed.map((r) => r.message).join('; ')
+            : `cloning ${underway.map((r) => r.name).join(', ')}`,
+      });
+    }
+  } else if (previous?.phase !== 'Ready' || previous.projectId !== projectId) {
+    // projectClone.start registers the project before git runs, so an
+    // existing project can still be an unfinished or failed clone. Check
+    // until it has files once; after that it is Ready and the check is
+    // skipped.
     // directoryPath '' reads the folder as it is now. Without it t3 answers
     // from its search index for the path, which, made while a failed clone
     // left the folder empty, stays empty after t3 deletes the folder and the
@@ -329,13 +443,23 @@ async function syncProject(
       } catch (error) {
         if (!/in progress|not empty/i.test(errorMessage(error))) throw error;
       }
-      return cloning(projectId, previous?.repository ?? cr.spec.repository);
+      return cloning(projectId, previous?.repository ?? repositoryOf(cr));
     }
   }
 
-  const digest = hash({ title, project: cr.spec.project ?? {}, settings: cr.spec.settings ?? null });
+  // Repositories outside the project folder are tracked in it. The operator
+  // adds and removes only those, by path, so folders added in t3 stay.
+  const tracked = (repositories ?? []).filter((r) => r.tracked);
+  const untrack = (previous?.trackedFolders ?? []).filter((path) => !tracked.some((r) => r.path === path));
+  const digest = hash({
+    title,
+    project: cr.spec.project ?? {},
+    settings: cr.spec.settings ?? null,
+    ...(repositories === null ? {} : { tracked: tracked.map((r) => [r.name, r.path]) }),
+  });
   let applied = { appliedHash: previous?.appliedHash ?? null, appliedAt: previous?.appliedAt ?? null };
   let managesSettings = carried.managesSettings;
+  let trackedFolders = carried.trackedFolders;
   if (needsApply(previous, previous?.podUID, digest, env, now)) {
     await t3.mutateProject({
       // Unarchive a project an earlier Archive left behind.
@@ -345,7 +469,10 @@ async function syncProject(
       commandId: randomUUID(),
       projectId,
       title,
+      ...(tracked.length > 0 ? { trackFolders: tracked.map((r) => ({ path: r.path, name: r.name })) } : {}),
+      ...(untrack.length > 0 ? { untrackFolders: untrack } : {}),
     });
+    if (repositories !== null) trackedFolders = tracked.map((r) => r.path);
     // `settings` replaces the project's whole override set; removing it from
     // the spec clears the overrides this operator set.
     if (cr.spec.settings !== undefined || managesSettings) {
@@ -363,8 +490,81 @@ async function syncProject(
     projectId,
     managesSettings,
     ...applied,
+    ...(repositories === null ? {} : { repositories: repositoryStatuses, trackedFolders }),
     message: isOwnId(name, projectId) ? null : `adopted existing project ${projectId}`,
   });
+}
+
+// Clones each repository of a multi-repository project that this pod doesn't
+// have yet, and reports where each stands. A repository is Ready once its
+// folder holds files: a clone that finished, or files that were there
+// already (a restarted pod, or a checkout made by hand), which are kept as
+// they are. A failed clone is retried after CLONE_RETRY_MS, or at once for a
+// changed URL or a restarted pod.
+async function syncRepositories(
+  deps: Deps,
+  env: Environment,
+  repositories: ReadonlyArray<ResolvedRepository>,
+  previous: EnvironmentStatus | undefined,
+): Promise<ReadonlyArray<RepositoryStatus>> {
+  const now = deps.now();
+  const statuses: RepositoryStatus[] = [];
+  for (const repo of repositories) {
+    const status = (fields: Pick<RepositoryStatus, 'phase' | 'message' | 'repository' | 'since'>): RepositoryStatus => ({
+      name: repo.name,
+      path: repo.path,
+      ...fields,
+    });
+    const before = previous?.repositories?.find((r) => r.name === repo.name && r.path === repo.path);
+    if (before?.phase === 'Ready' && previous?.podUID === env.uid) {
+      // A changed URL doesn't replace a checkout: its files stay.
+      const message =
+        before.repository !== null && before.repository !== repo.url
+          ? `checked out from ${before.repository}; a changed url is not cloned again`
+          : before.message;
+      statuses.push(status({ phase: 'Ready', message, repository: before.repository, since: null }));
+      continue;
+    }
+    let job = deps.clones.get(env.name, repo.path);
+    const retry =
+      job !== undefined &&
+      (job.podUID !== env.uid ||
+        (job.phase === 'failed' && (job.remoteUrl !== repo.url || now.getTime() - Date.parse(job.endedAt ?? '') >= CLONE_RETRY_MS)));
+    if (job === undefined || retry) {
+      job = await deps.clones.start(
+        { environment: env.name, podUID: env.uid, destinationPath: repo.path, remoteUrl: repo.url },
+        deps.connect(env.name),
+      );
+    }
+    if (job.phase === 'running') {
+      statuses.push(
+        status({ phase: 'Cloning', message: `cloning ${job.remoteUrl} into ${repo.path}`, repository: job.remoteUrl, since: job.startedAt }),
+      );
+    } else if (job.phase === 'done') {
+      // Recorded in status from here on; a later pod checks its folder anew.
+      deps.clones.forget(env.name, repo.path);
+      statuses.push(
+        status({
+          phase: 'Ready',
+          // Files there already, which a restarted pod finds of its own
+          // clone: said only of files the operator didn't clone.
+          message: !job.existing ? null : before === undefined ? `kept the files already in ${repo.path}` : before.message,
+          repository: job.existing ? (before?.repository ?? null) : job.remoteUrl,
+          since: null,
+        }),
+      );
+    } else {
+      statuses.push(
+        status({
+          phase: 'Error',
+          message: `clone of ${job.remoteUrl} into ${repo.path} failed: ${job.error ?? 'no detail'}`,
+          repository: job.remoteUrl,
+          since: job.endedAt,
+        }),
+      );
+    }
+  }
+  return statuses;
 }
 
 // A clone t3 gave up on: Error with git's message, which doesn't hold the
@@ -382,12 +582,13 @@ async function failedClone(
   carried: Pick<EnvironmentStatus, 'name' | 'environmentSet' | 'podUID' | 'managesSettings' | 'tasks'>,
 ): Promise<EnvironmentStatus> {
   const now = deps.now();
+  const repository = repositoryOf(cr);
   const from = previous?.repository ?? clone.remoteUrl;
-  if (from !== cr.spec.repository) {
+  if (from !== repository) {
     await t3.mutateProject({ type: 'project.delete', commandId: randomUUID(), projectId: clone.projectId, force: true });
     // The plain id is used by now: it was this clone's, or one before it.
     const started = await startClone(t3, cr, freshId(cr.metadata.name), now);
-    return cloning(started, cr.spec.repository, now.toISOString());
+    return cloning(started, repository, now.toISOString());
   }
   const failedAt = clone.endedAt === null ? 0 : Date.parse(clone.endedAt);
   if (now.getTime() - failedAt >= CLONE_RETRY_MS) {

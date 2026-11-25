@@ -67,8 +67,9 @@ mutations for `t3 project add`.
 | Operation | Transport | Method | Scope |
 |---|---|---|---|
 | List projects | HTTP | `GET /api/projects` | `orchestration:read` |
-| Create, update or delete a project | HTTP | `POST /api/projects/mutate` | `orchestration:operate` (+`settings:write` for `scripts`) |
+| Create, update or delete a project (also its tracked folders, `trackFolders` / `untrackFolders`) | HTTP | `POST /api/projects/mutate` | `orchestration:operate` (+`settings:write` for `scripts`) |
 | Clone a URL and register it | RPC | `projectClone.start` | `source-control:write` |
+| Clone a URL into a folder, registering nothing | RPC | `sourceControl.cloneRepository` | `source-control:write` |
 | Check whether a checkout has files | RPC | `projects.listEntries` | `filesystem:read` |
 | Project setting overrides | RPC | `server.updateSettings` (`projectSettingsOverrides`) | `settings:write` |
 | Scheduled tasks | RPC | `scheduledTasks.upsert` / `.delete` | `orchestration:operate` |
@@ -172,8 +173,24 @@ Each pass:
         Call `projectClone.start` again: t3 reuses the project, or answers
         "already in progress", or "not empty" while git has written only
         `.git`.
+      **With `repositories`** (several repositories in one project) it goes
+      differently: the project folder is a plain folder, registered with
+      `project.create` (`createWorkspaceRootIfMissing`). Each repository is
+      cloned into its folder with `sourceControl.cloneRepository`, which
+      registers nothing, but answers only once git is done and has no
+      progress feed. So each clone is a call on a connection of its own,
+      kept in memory between passes ([src/clones.ts](../src/clones.ts)); a
+      pass reads where each stands. "Not empty" means files are there
+      already (a restarted pod's own clone, or one made by hand), which are
+      kept. A failed clone is retried after 5 minutes, at once for a
+      changed URL, or for a restarted pod, which ended it. Once a
+      repository is `Ready` on a pod it isn't checked again there. After an
+      operator restart, the closed connection ends t3's clone (git removes
+      what it wrote when it is stopped), and the next pass starts it over.
    3. **Apply the spec:** `project.update` (`spec.project`, the title,
-      `archived: false`), then `server.updateSettings` with
+      `archived: false`, and for `repositories` the folders outside the
+      project folder: `trackFolders`, and `untrackFolders` for the ones it
+      tracked before and no longer should), then `server.updateSettings` with
       `projectSettingsOverrides[id] = spec.settings`. This runs only when
       something changed: a hash of the desired state, the pod UID, or the last
       apply being over an hour old. The hourly resync repairs edits made in

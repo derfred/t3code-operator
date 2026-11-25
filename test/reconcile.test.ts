@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
+import { Clones } from '../src/clones.ts';
 import type { Environment, Kube } from '../src/kube.ts';
 import {
   CLONE_GATE_MS,
@@ -23,7 +24,9 @@ import { T3Error, type T3, type T3Project } from '../src/t3.ts';
 // ─── fakes ───────────────────────────────────────────────────────────────────
 
 class FakeT3 implements T3 {
-  projects: Array<T3Project & { archived?: boolean; pinned?: boolean }> = [];
+  projects: Array<
+    T3Project & { archived?: boolean; pinned?: boolean; trackedFolders?: Array<{ path: string; name: string }> }
+  > = [];
   files = new Map<string, number>();
   cloning = new Set<string>();
   // Clones that have written .git, which projects.listEntries doesn't list.
@@ -36,6 +39,9 @@ class FakeT3 implements T3 {
   deletedIds = new Set<string>();
   overrides: Record<string, unknown> = {};
   tasks = new Map<string, Record<string, unknown>>();
+  // sourceControl.cloneRepository: held clones answer only when finished.
+  holdRepositoryClones = false;
+  heldRepositoryClones = new Map<string, { resolve: () => void; reject: (error: Error) => void }>();
   calls: Array<{ method: string; payload: any }> = [];
 
   async listProjects() {
@@ -50,6 +56,10 @@ class FakeT3 implements T3 {
       const project = this.live().find((p) => p.id === m.projectId);
       if (!project) throw new T3Error('Project not found');
       Object.assign(project, { title: m.title ?? project.title, archived: m.archived, pinned: m.pinned });
+      const untracked = new Set(m.untrackFolders ?? []);
+      const kept = (project.trackedFolders ?? []).filter((f) => !untracked.has(f.path));
+      const added = (m.trackFolders ?? []).filter((f: any) => !kept.some((k) => k.path === f.path));
+      project.trackedFolders = [...kept, ...added];
     } else if (m.type === 'project.delete') {
       const project = this.live().find((p) => p.id === m.projectId);
       this.projects = this.projects.filter((p) => p.id !== m.projectId);
@@ -95,6 +105,20 @@ class FakeT3 implements T3 {
         if (!clone || (clone.phase !== 'failed' && clone.phase !== 'cancelled')) return { applied: false };
         this.clones.set(payload.projectId, { ...clone, phase: 'running', error: null, endedAt: null });
         return { applied: true };
+      }
+      case 'sourceControl.cloneRepository': {
+        const path = payload.destinationPath;
+        if (this.existingCheckouts.has(path) || (this.files.get(path) ?? 0) > 0) {
+          throw new T3Error('Destination path already exists and is not empty.');
+        }
+        const done = () => {
+          this.files.set(path, 3);
+          return { cwd: path, remoteUrl: payload.remoteUrl, repository: null };
+        };
+        if (!this.holdRepositoryClones) return done();
+        return new Promise((resolve, reject) =>
+          this.heldRepositoryClones.set(path, { resolve: () => resolve(done()), reject }),
+        );
       }
       case 'projects.listEntries':
         // Only a directory read is current: t3's search index, which answers
@@ -187,12 +211,14 @@ function setup(sets = defaultSets()) {
   const kube = new FakeKube();
   const servers = new Map(sets.flatMap((s) => (s.environments ?? []).map((e) => [e.name, new FakeT3()] as const)));
   let now = new Date('2026-11-13T10:00:00Z');
-  const deps = { kube, t3: (name: string) => servers.get(name)!, now: () => now };
+  const clones = new Clones({ now: () => now, quickMs: 0 });
+  const deps = { kube, t3: (name: string) => servers.get(name)!, connect: (name: string) => servers.get(name)!, clones, now: () => now };
   return {
     kube,
     deps,
     server: (name: string) => servers.get(name)!,
     world: () => new World(sets),
+    clones,
     sets,
     advance: (ms: number) => (now = new Date(now.getTime() + ms)),
   };
@@ -676,5 +702,185 @@ describe('reconcileEnvironmentSet', () => {
     const { deps, kube } = setup();
     await reconcileEnvironmentSet(deps, setCr, { name: 'bugzoo', labels: {}, environments: null }, new Map());
     assert.equal(kube.lastStatus().message, 'StatefulSet t3code-bugzoo not found');
+  });
+});
+
+// ─── multi-repository projects ───────────────────────────────────────────────
+
+describe('reconcileProject with repositories', () => {
+  const one = (uid = 'uid-bugzoo-0'): PlacedSet[] => [{ name: 'bugzoo', labels: {}, environments: [env('bugzoo-0', { uid })] }];
+  const multi = (repositories: NonNullable<ProjectResource['spec']['repositories']>, spec: Partial<ProjectResource['spec']> = {}) =>
+    project({ repository: undefined, repositories, ...spec });
+  const shop = {
+    api: { url: 'git@github.com:derfred/api.git' },
+    web: { url: 'git@github.com:derfred/web.git', path: 'apps/web' },
+  };
+
+  it('registers the plain project folder, clones each repository into it, then applies the spec', async () => {
+    const { deps, kube, world, server } = setup(one());
+    const t3 = server('bugzoo-0');
+    const cr = multi(shop, { project: { autoPull: true } });
+    await reconcileProject(deps, cr, world());
+
+    const create = t3.calls.find((c) => c.method === 'project.create')!.payload;
+    assert.equal(create.workspaceRoot, '/workspace/infra');
+    assert.equal(create.createWorkspaceRootIfMissing, true);
+    assert.equal(t3.methods().includes('projectClone.start'), false, 'no project per repository');
+    assert.deepEqual(
+      t3.calls.filter((c) => c.method === 'sourceControl.cloneRepository').map((c) => c.payload),
+      [
+        { remoteUrl: 'git@github.com:derfred/api.git', destinationPath: '/workspace/infra/api' },
+        { remoteUrl: 'git@github.com:derfred/web.git', destinationPath: '/workspace/infra/apps/web' },
+      ],
+    );
+    const status = envStatus(kube, 'bugzoo-0');
+    assert.equal(status.phase, 'Ready');
+    assert.deepEqual(
+      status.repositories.map((r: any) => [r.name, r.path, r.phase, r.repository]),
+      [
+        ['api', '/workspace/infra/api', 'Ready', 'git@github.com:derfred/api.git'],
+        ['web', '/workspace/infra/apps/web', 'Ready', 'git@github.com:derfred/web.git'],
+      ],
+    );
+    assert.equal(t3.calls.find((c) => c.method === 'project.update')!.payload.autoPull, true);
+    assert.deepEqual(status.trackedFolders, []);
+  });
+
+  it('is Cloning, holding the gate, until every clone has finished', async () => {
+    const { deps, kube, world, server, clones } = setup(one());
+    const t3 = server('bugzoo-0');
+    t3.holdRepositoryClones = true;
+    let cr = multi(shop);
+    await reconcileProject(deps, cr, world());
+    let status = envStatus(kube, 'bugzoo-0');
+    assert.equal(status.phase, 'Cloning');
+    assert.equal(status.message, 'cloning api, web');
+    assert.equal(status.cloningSince, deps.now().toISOString());
+    assert.equal(holdsGate({ project: 'infra', phase: status.phase, cloningSince: status.cloningSince }, deps.now()), true);
+    assert.equal(t3.methods().includes('project.update'), false, 'the spec waits for the checkouts');
+
+    await reconcileProject(deps, (cr = observed(cr, kube)), world());
+    assert.equal(t3.calls.filter((c) => c.method === 'sourceControl.cloneRepository').length, 2, 'a running clone is not started again');
+
+    t3.heldRepositoryClones.get('/workspace/infra/api')!.resolve();
+    await new Promise((resolve) => setImmediate(resolve));
+    await reconcileProject(deps, (cr = observed(cr, kube)), world());
+    status = envStatus(kube, 'bugzoo-0');
+    assert.equal(status.phase, 'Cloning');
+    assert.equal(status.message, 'cloning web');
+
+    t3.heldRepositoryClones.get('/workspace/infra/apps/web')!.resolve();
+    await clones.settled();
+    await reconcileProject(deps, observed(cr, kube), world());
+    assert.equal(envStatus(kube, 'bugzoo-0').phase, 'Ready');
+  });
+
+  it('reports a failed clone as Error, and retries it later, or at once for a changed url', async () => {
+    const { deps, kube, world, server, clones, advance } = setup(one());
+    const t3 = server('bugzoo-0');
+    t3.holdRepositoryClones = true;
+    let cr = multi({ api: { url: 'git@github.com:derfred/typo.git' } });
+    await reconcileProject(deps, cr, world());
+    t3.heldRepositoryClones.get('/workspace/infra/api')!.reject(new T3Error('ERROR: Repository not found.'));
+    await clones.settled();
+
+    await reconcileProject(deps, (cr = observed(cr, kube)), world());
+    let status = envStatus(kube, 'bugzoo-0');
+    assert.equal(status.phase, 'Error');
+    assert.equal(status.message, 'clone of git@github.com:derfred/typo.git into /workspace/infra/api failed: ERROR: Repository not found.');
+    assert.equal(holdsGate({ project: 'infra', phase: status.phase, cloningSince: status.cloningSince }, deps.now()), false);
+    const starts = () => t3.calls.filter((c) => c.method === 'sourceControl.cloneRepository').map((c) => c.payload.remoteUrl);
+    assert.equal(starts().length, 1, 'not retried straight away');
+
+    advance(CLONE_RETRY_MS);
+    await reconcileProject(deps, (cr = observed(cr, kube)), world());
+    assert.equal(envStatus(kube, 'bugzoo-0').phase, 'Cloning');
+    assert.deepEqual(starts(), ['git@github.com:derfred/typo.git', 'git@github.com:derfred/typo.git']);
+    t3.heldRepositoryClones.get('/workspace/infra/api')!.reject(new T3Error('ERROR: Repository not found.'));
+    await clones.settled();
+
+    cr = observed({ ...cr, spec: { ...cr.spec, repositories: { api: { url: 'git@github.com:derfred/api.git' } } } }, kube);
+    await reconcileProject(deps, cr, world());
+    status = envStatus(kube, 'bugzoo-0');
+    assert.equal(status.phase, 'Cloning');
+    assert.equal(starts().at(-1), 'git@github.com:derfred/api.git');
+  });
+
+  it('keeps files already in a repository’s folder, and finds its own clone on a restarted pod', async () => {
+    let sets = one();
+    const { deps, kube, world, server } = setup(sets);
+    const t3 = server('bugzoo-0');
+    t3.existingCheckouts.add('/workspace/infra/api');
+    let cr = multi(shop);
+    await reconcileProject(deps, cr, world());
+    let status = envStatus(kube, 'bugzoo-0');
+    assert.equal(status.phase, 'Ready');
+    assert.deepEqual(
+      status.repositories.map((r: any) => [r.name, r.message, r.repository]),
+      [
+        ['api', 'kept the files already in /workspace/infra/api', null],
+        ['web', null, 'git@github.com:derfred/web.git'],
+      ],
+    );
+
+    const calls = t3.calls.length;
+    await reconcileProject(deps, (cr = observed(cr, kube)), world());
+    assert.equal(t3.calls.slice(calls).some((c) => c.method === 'sourceControl.cloneRepository'), false, 'a Ready repository is not checked again');
+
+    // The pod restarts on the same volume: each folder answers "not empty".
+    sets[0] = one('uid-new')[0]!;
+    await reconcileProject(deps, (cr = observed(cr, kube)), world());
+    status = envStatus(kube, 'bugzoo-0');
+    assert.equal(status.phase, 'Ready');
+    assert.deepEqual(
+      status.repositories.map((r: any) => [r.name, r.message, r.repository]),
+      [
+        ['api', 'kept the files already in /workspace/infra/api', null],
+        ['web', null, 'git@github.com:derfred/web.git'],
+      ],
+      'its own clone is not reported as files found',
+    );
+  });
+
+  it('tracks a repository outside the project folder, and untracks it once it leaves the spec', async () => {
+    const { deps, kube, world, server } = setup(one());
+    const t3 = server('bugzoo-0');
+    let cr = multi({ ...shop, shared: { url: 'git@github.com:derfred/shared.git', path: '/workspace/shared' } });
+    await reconcileProject(deps, cr, world());
+    let update = t3.calls.findLast((c) => c.method === 'project.update')!.payload;
+    assert.deepEqual(update.trackFolders, [{ path: '/workspace/shared', name: 'shared' }]);
+    assert.equal(update.untrackFolders, undefined);
+    assert.deepEqual(envStatus(kube, 'bugzoo-0').trackedFolders, ['/workspace/shared']);
+    // A folder someone added in t3.
+    t3.projects[0]!.trackedFolders!.push({ path: '/srv/notes', name: 'notes' });
+
+    cr = observed({ ...cr, spec: { ...cr.spec, repositories: shop } }, kube);
+    await reconcileProject(deps, cr, world());
+    update = t3.calls.findLast((c) => c.method === 'project.update')!.payload;
+    assert.equal(update.trackFolders, undefined);
+    assert.deepEqual(update.untrackFolders, ['/workspace/shared']);
+    assert.deepEqual(t3.projects[0]!.trackedFolders, [{ path: '/srv/notes', name: 'notes' }], 'folders added in t3 stay');
+    assert.deepEqual(envStatus(kube, 'bugzoo-0').trackedFolders, []);
+  });
+
+  it('refuses a spec t3 could not follow, as Error', async () => {
+    const cases: Array<[Partial<ProjectResource['spec']>, string]> = [
+      [{ repository: 'git@github.com:derfred/infra.git', repositories: shop }, 'spec has both repository and repositories; give one'],
+      [{ repository: undefined }, 'spec needs repository or repositories'],
+      [{ repository: undefined, repositories: { deep: { url: 'u', path: 'a/b/c' } } }, 'repository deep: /workspace/infra/a/b/c is more than two levels inside /workspace/infra, deeper than t3 looks for repositories'],
+      [{ repository: undefined, repositories: { up: { url: 'u', path: '/workspace' } } }, 'repository up: /workspace contains the project folder /workspace/infra'],
+      [{ repository: undefined, repositories: { self: { url: 'u', path: '.' } } }, 'repository self: /workspace/infra is the project folder itself'],
+      [
+        { repository: undefined, repositories: { a: { url: 'u', path: 'libs' }, b: { url: 'u', path: 'libs/b' } } },
+        'repositories a and b: /workspace/infra/libs and /workspace/infra/libs/b overlap',
+      ],
+    ];
+    for (const [spec, message] of cases) {
+      const { deps, kube, world, server } = setup(one());
+      await reconcileProject(deps, project(spec), world());
+      assert.equal(envStatus(kube, 'bugzoo-0').phase, 'Error');
+      assert.equal(envStatus(kube, 'bugzoo-0').message, message);
+      assert.equal(server('bugzoo-0').calls.length, 0, 'nothing is done on t3');
+    }
   });
 });
